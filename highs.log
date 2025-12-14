@@ -1,0 +1,317 @@
+LP has 1058829 rows; 1587221 cols; 2120687 nonzeros
+Coefficient ranges:
+  Matrix  [3e-04, 1e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Presolving model
+1058809 rows, 1587204 cols, 2120618 nonzeros  0s
+528901 rows, 1057296 cols, 1057826 nonzeros  1s
+22 rows, 264 cols, 44 nonzeros  1s
+0 rows, 11 cols, 0 nonzeros  1s
+0 rows, 0 cols, 0 nonzeros  1s
+Presolve reductions: rows 0(-1058829); columns 0(-1587221); nonzeros 0(-2120687) - Reduced to empty
+Performed postsolve
+Solving the original LP from the solution after postsolve
+
+Model status        : Optimal
+Objective value     :  0.0000000000e+00
+P-D objective error :  0.0000000000e+00
+HiGHS run time      :          2.33
+LP has 1246794 rows; 1587221 cols; 2870864 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     5.4620049915e-11 Pr: 187965(938.328); Du: 0(9.51587e-08) 3s
+       8840     3.4795190089e+01 Pr: 116996(23022.6); Du: 0(2.89417e-07) 10s
+      10921     3.6874297915e+01 Pr: 66289(1121.21); Du: 0(3.56759e-07) 15s
+      13061     3.8233758717e+01 Pr: 62117(430.816); Du: 0(6.25731e-07) 20s
+      15050     3.8912988662e+01 Pr: 58219(1603.85); Du: 0(1.06988e-06) 26s
+      16976     3.9318172009e+01 Pr: 58504(20259.9); Du: 0(1.43413e-06) 32s
+      18581     3.9518146973e+01 Pr: 31695(118.76); Du: 0(1.83788e-06) 38s
+      20751     3.9662018558e+01 Pr: 17209(27.4134); Du: 0(2.38604e-06) 43s
+      24512     3.9726932488e+01 Pr: 13764(80.0708); Du: 0(3.05721e-06) 50s
+      26422     3.9730379394e+01 Pr: 0(0); Du: 0(6.68553e-13) 54s
+
+Model status        : Optimal
+Simplex   iterations: 26422
+Objective value     :  3.9730379394e+01
+P-D objective error :  2.9671900043e-14
+HiGHS run time      :         53.89
+LP has 1446794 rows; 1587221 cols; 3668277 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     3.9730438135e+01 Pr: 200000(16015.7); Du: 0(7.00445e-06) 55s
+       1092     4.2160563440e+01 Pr: 52356(1672.05); Du: 0(6.58225e-06) 61s
+       1971     4.2747197751e+01 Pr: 83666(7189.09); Du: 0(6.22351e-06) 66s
+       2832     4.3200499602e+01 Pr: 83452(4700.99); Du: 0(6.2069e-06) 72s
+       3642     4.3562561418e+01 Pr: 69993(1994.92); Du: 0(6.05828e-06) 78s
+       4536     4.3931343776e+01 Pr: 82843(8265.14); Du: 0(6.00637e-06) 84s
+       5379     4.4221777564e+01 Pr: 50317(1202.7); Du: 0(5.98044e-06) 90s
+       6271     4.4456963397e+01 Pr: 46206(2410.52); Du: 0(5.88259e-06) 96s
+       7128     4.4645362148e+01 Pr: 52119(15720.2); Du: 0(5.99981e-06) 102s
+       8000     4.4829305899e+01 Pr: 35602(160.828); Du: 0(6.0557e-06) 108s
+       8801     4.4937375090e+01 Pr: 69822(1481.34); Du: 0(6.21948e-06) 114s
+       9616     4.5039487497e+01 Pr: 11726(6.79524); Du: 0(6.18642e-06) 121s
+      10437     4.5126755233e+01 Pr: 16318(3.13037); Du: 0(6.31257e-06) 127s
+      11298     4.5199364751e+01 Pr: 34791(212.968); Du: 0(6.44654e-06) 132s
+      12178     4.5254690245e+01 Pr: 15291(8.06217); Du: 0(6.62295e-06) 137s
+      13076     4.5294678389e+01 Pr: 27473(126.102); Du: 0(6.62801e-06) 143s
+      14025     4.5318333526e+01 Pr: 20846(7.31851); Du: 0(6.63985e-06) 150s
+      14944     4.5326411781e+01 Pr: 1702(0.0171874); Du: 0(6.75943e-06) 155s
+      15686     4.5327518603e+01 Pr: 0(0); Du: 0(4.66933e-13) 158s
+
+Model status        : Optimal
+Simplex   iterations: 15686
+Objective value     :  4.5327518603e+01
+P-D objective error :  7.8298824046e-15
+HiGHS run time      :        158.43
+LP has 1646794 rows; 1587221 cols; 4465876 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     4.5327583772e+01 Pr: 200000(5185.16); Du: 0(8.89641e-06) 159s
+       1127     4.6526419906e+01 Pr: 50790(403.915); Du: 0(9.16553e-06) 166s
+       2061     4.6920755533e+01 Pr: 182883(33996.7); Du: 0(9.04685e-06) 174s
+       2935     4.7099907850e+01 Pr: 59445(709.057); Du: 0(9.4029e-06) 183s
+       3748     4.7208982284e+01 Pr: 93345(9460.18); Du: 0(9.45766e-06) 191s
+       4582     4.7293566591e+01 Pr: 48310(832.624); Du: 0(9.99512e-06) 198s
+       5469     4.7329396807e+01 Pr: 16458(13.9489); Du: 0(1.03114e-05) 206s
+       6412     4.7343777884e+01 Pr: 53667(2474.79); Du: 0(1.04427e-05) 215s
+       7476     4.7347861080e+01 Pr: 65(1.82393e-05); Du: 0(1.09993e-05) 223s
+       7563     4.7347801873e+01 Pr: 0(0); Du: 0(1.31006e-14) 224s
+
+Model status        : Optimal
+Simplex   iterations: 7563
+Objective value     :  4.7347801873e+01
+P-D objective error :  2.2943342928e-14
+HiGHS run time      :        223.97
+LP has 1846794 rows; 1587221 cols; 5263467 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     4.7347869658e+01 Pr: 200000(8705.74); Du: 0(1.11765e-05) 225s
+       1182     4.8321577675e+01 Pr: 49153(219.802); Du: 0(1.10606e-05) 235s
+       2195     4.8568768829e+01 Pr: 132755(7873.7); Du: 0(1.11191e-05) 244s
+       3141     4.8644902080e+01 Pr: 31031(28.3973); Du: 0(1.12254e-05) 256s
+       4441     4.8662062601e+01 Pr: 1032(0.0120079); Du: 0(1.14665e-05) 266s
+       4948     4.8662398516e+01 Pr: 0(0); Du: 0(3.66829e-13) 269s
+
+Model status        : Optimal
+Simplex   iterations: 4948
+Objective value     :  4.8662398516e+01
+P-D objective error :  1.0911993346e-14
+HiGHS run time      :        269.54
+LP has 2046794 rows; 1587221 cols; 6060906 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     4.8662468018e+01 Pr: 200000(8786); Du: 0(1.49544e-05) 271s
+        968     4.9934457995e+01 Pr: 325662(47577.5); Du: 0(1.46171e-05) 284s
+       1897     5.0568231647e+01 Pr: 93993(1367.01); Du: 0(1.49362e-05) 298s
+       2923     5.0994427315e+01 Pr: 28308(15.2848); Du: 0(1.51418e-05) 311s
+       3995     5.1134757004e+01 Pr: 76776(1208.61); Du: 0(1.51339e-05) 324s
+       5085     5.1170432224e+01 Pr: 24321(103.687); Du: 0(1.50377e-05) 338s
+       6230     5.1183999247e+01 Pr: 6995(23.0462); Du: 0(1.5249e-05) 351s
+       7645     5.1187330894e+01 Pr: 0(0); Du: 0(1.56315e-05) 363s
+       7645     5.1187255870e+01 Pr: 0(0); Du: 0(1.43107e-10) 363s
+
+Model status        : Optimal
+Simplex   iterations: 7645
+Objective value     :  5.1187255870e+01
+P-D objective error :  2.5294409846e-14
+HiGHS run time      :        363.13
+LP has 2246794 rows; 1587221 cols; 6858502 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     5.1187333700e+01 Pr: 200000(12171.1); Du: 0(1.68971e-05) 365s
+       1066     5.2494712664e+01 Pr: 103841(193.834); Du: 0(1.638e-05) 380s
+       2106     5.2816744723e+01 Pr: 192439(423918); Du: 0(1.63687e-05) 396s
+       3121     5.2922644044e+01 Pr: 117619(5181.21); Du: 0(1.6246e-05) 413s
+       4252     5.2961724200e+01 Pr: 9868(0.591395); Du: 0(1.66045e-05) 430s
+       5395     5.2974339191e+01 Pr: 22461(577.525); Du: 0(1.66001e-05) 446s
+       5925     5.2975038196e+01 Pr: 0(0); Du: 0(1.65232e-05) 452s
+       5925     5.2974957214e+01 Pr: 0(0); Du: 0(1.29238e-11) 452s
+
+Model status        : Optimal
+Simplex   iterations: 5925
+Objective value     :  5.2974957214e+01
+P-D objective error :  1.4682568513e-14
+HiGHS run time      :        451.89
+LP has 2446794 rows; 1587221 cols; 7656113 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     5.2975039194e+01 Pr: 200000(11559.2); Du: 0(1.94667e-05) 454s
+       1068     5.4146898770e+01 Pr: 171974(37110.9); Du: 0(1.87228e-05) 472s
+       2274     5.4770706234e+01 Pr: 58160(190.389); Du: 0(1.85391e-05) 494s
+       3340     5.4919388758e+01 Pr: 8771(262.138); Du: 0(1.88255e-05) 515s
+       4399     5.4962983008e+01 Pr: 5770(0.70789); Du: 0(1.87882e-05) 535s
+       5578     5.4973436669e+01 Pr: 11494(120.495); Du: 0(1.89421e-05) 554s
+       6077     5.4973859012e+01 Pr: 0(0); Du: 0(1.90324e-05) 561s
+       6077     5.4973771809e+01 Pr: 0(0); Du: 0(1.08377e-11) 561s
+
+Model status        : Optimal
+Simplex   iterations: 6077
+Objective value     :  5.4973771809e+01
+P-D objective error :  1.0246899932e-15
+HiGHS run time      :        560.94
+LP has 2646794 rows; 1587221 cols; 8453526 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     5.4973853242e+01 Pr: 200000(20306.1); Du: 0(1.78894e-05) 563s
+       1084     5.6307044625e+01 Pr: 164260(5384.46); Du: 0(1.77316e-05) 587s
+       2206     5.6858900524e+01 Pr: 42407(109.38); Du: 0(1.76906e-05) 610s
+       3575     5.7041561639e+01 Pr: 216645(106538); Du: 0(1.77964e-05) 635s
+       5061     5.7068892723e+01 Pr: 819(0.0195423); Du: 0(1.76732e-05) 659s
+       5697     5.7069906645e+01 Pr: 0(0); Du: 0(1.7725e-05) 668s
+       5697     5.7069818898e+01 Pr: 0(0); Du: 0(2.73035e-13) 668s
+
+Model status        : Optimal
+Simplex   iterations: 5697
+Objective value     :  5.7069818898e+01
+P-D objective error :  6.8499645456e-15
+HiGHS run time      :        668.24
+LP has 2846794 rows; 1587221 cols; 9251099 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     5.7069910634e+01 Pr: 200000(13827.1); Du: 0(1.8335e-05) 673s
+       1279     5.8182719102e+01 Pr: 95097(487.143); Du: 0(1.78495e-05) 701s
+       2387     5.8605082188e+01 Pr: 866042(242055); Du: 0(1.80159e-05) 728s
+       3489     5.8755572557e+01 Pr: 76218(839.753); Du: 0(1.80079e-05) 755s
+       4672     5.8816556223e+01 Pr: 73515(1129.99); Du: 0(1.81114e-05) 781s
+       5872     5.8841166347e+01 Pr: 135235(2117.96); Du: 0(1.81054e-05) 807s
+       7140     5.8848176166e+01 Pr: 1141(0.0140138); Du: 0(1.81422e-05) 835s
+       7778     5.8848646341e+01 Pr: 0(0); Du: 0(1.80649e-05) 844s
+       7778     5.8848550788e+01 Pr: 0(0); Du: 0(5.42855e-13) 844s
+
+Model status        : Optimal
+Simplex   iterations: 7778
+Objective value     :  5.8848550788e+01
+P-D objective error :  5.9861843830e-17
+HiGHS run time      :        844.42
+LP has 3046794 rows; 1587221 cols; 10048728 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     5.8848646956e+01 Pr: 200000(4372.13); Du: 0(2.30687e-05) 848s
+       1120     6.0644434072e+01 Pr: 180002(7319.06); Du: 0(2.27226e-05) 879s
+       2281     6.1024819502e+01 Pr: 123144(1227.42); Du: 0(2.25381e-05) 909s
+       3349     6.1206400667e+01 Pr: 96282(460.855); Du: 0(2.28188e-05) 937s
+       4413     6.1276105956e+01 Pr: 16146(1.967); Du: 0(2.33406e-05) 966s
+       5619     6.1323200491e+01 Pr: 10147(1.12973); Du: 0(2.34986e-05) 995s
+       6762     6.1343851384e+01 Pr: 341313(5993.12); Du: 0(2.37666e-05) 1025s
+       9195     6.1355742048e+01 Pr: 0(0); Du: 0(2.38961e-05) 1083s
+       9195     6.1355639711e+01 Pr: 0(0); Du: 0(9.08668e-11) 1083s
+
+Model status        : Optimal
+Simplex   iterations: 9195
+Objective value     :  6.1355639711e+01
+P-D objective error :  7.3517524515e-15
+HiGHS run time      :       1083.55
+LP has 3246794 rows; 1587221 cols; 10846179 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     6.1355737298e+01 Pr: 200000(10299); Du: 0(2.47205e-05) 1088s
+       2578     6.2658196744e+01 Pr: 485110(69018.9); Du: 0(2.49974e-05) 1161s
+       4831     6.2684074443e+01 Pr: 0(0); Du: 0(2.50136e-05) 1221s
+       4831     6.2683973404e+01 Pr: 0(0); Du: 0(4.62071e-10) 1221s
+
+Model status        : Optimal
+Simplex   iterations: 4831
+Objective value     :  6.2683973404e+01
+P-D objective error :  7.7319236454e-13
+HiGHS run time      :       1220.91
+LP has 3446794 rows; 1587221 cols; 11643614 nonzeros
+Coefficient ranges:
+  Matrix  [6e-08, 6e+00]
+  Cost    [1e+00, 1e+00]
+  Bound   [0e+00, 0e+00]
+  RHS     [1e-08, 3e+01]
+WARNING: Problem has some excessively small row bounds
+Solving LP with useful basis so presolve not used
+Using EKK dual simplex solver - serial
+  Iteration        Objective     Infeasibilities num(sum)
+          0     6.2684076895e+01 Pr: 200000(12232.1); Du: 0(2.55189e-05) 1225s
+       2325     6.4020895354e+01 Pr: 127314(2742.27); Du: 0(2.51869e-05) 1299s
+       4809     6.4194151545e+01 Pr: 536452(152774); Du: 0(2.57565e-05) 1378s
+       6777     6.4204299508e+01 Pr: 0(0); Du: 0(2.56141e-05) 1434s
+       6777     6.4204192119e+01 Pr: 0(0); Du: 0(3.45031e-10) 1434s
+
+Model status        : Optimal
+Simplex   iterations: 6777
+Objective value     :  6.4204192119e+01
+P-D objective error :  2.0425407462e-14
+HiGHS run time      :       1434.62
