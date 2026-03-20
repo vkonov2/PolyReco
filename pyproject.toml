@@ -8,4 +8,8 @@ dependencies = [
     "numpy>=1.26.0",
     "highspy>=1.0.0",
     "matplotlib>=3.8.0",
+    "tqdm>=4.67.3",
 ]
+
+[project.scripts]
+window-line-functions-viewer = "run_window_line_functions_viewer:main"

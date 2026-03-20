@@ -165,9 +165,9 @@ def camera_from_normal(n: np.ndarray) -> tuple[float, float]:
     return elev, azim
 
 
-def build_viewer(model_path: Path, shadow_dir: Path, distance_scale: float) -> None:
+def build_viewer(model_path: Path, shadow_dir: Path, distance_scale: float, max_contours: int) -> None:
     model = parse_initial_model(model_path)
-    files = sorted(shadow_dir.glob("merged-cont*"))
+    files = sorted(shadow_dir.glob("merged-cont*"))[:max_contours]
     if not files:
         raise ValueError(f"No files matched {shadow_dir / 'merged-cont*'}")
     contours = [parse_merged_contour(p) for p in files]
@@ -246,7 +246,7 @@ def build_viewer(model_path: Path, shadow_dir: Path, distance_scale: float) -> N
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
-    plt.tight_layout(rect=(0.0, 0.07, 1.0, 1.0))
+    fig.subplots_adjust(left=0.03, right=0.97, top=0.92, bottom=0.16)
     plt.show()
 
 
@@ -272,9 +272,20 @@ def main() -> None:
         default=0.18,
         help="How far contour plane is moved from model (fraction of model radius)",
     )
+    parser.add_argument(
+        "--max-contours",
+        type=int,
+        default=200,
+        help="Use only first N merged-cont* files after sorting",
+    )
     args = parser.parse_args()
 
-    build_viewer(model_path=args.model, shadow_dir=args.shadow_dir, distance_scale=args.distance_scale)
+    build_viewer(
+        model_path=args.model,
+        shadow_dir=args.shadow_dir,
+        distance_scale=args.distance_scale,
+        max_contours=args.max_contours,
+    )
 
 
 if __name__ == "__main__":
