@@ -165,9 +165,16 @@ def camera_from_normal(n: np.ndarray) -> tuple[float, float]:
     return elev, azim
 
 
-def build_viewer(model_path: Path, shadow_dir: Path, distance_scale: float, max_contours: int) -> None:
+def build_viewer(
+    model_path: Path,
+    shadow_dir: Path,
+    distance_scale: float,
+    max_contours: int | None,
+) -> None:
     model = parse_initial_model(model_path)
-    files = sorted(shadow_dir.glob("merged-cont*"))[:max_contours]
+    files = sorted(shadow_dir.glob("merged-cont*"))
+    if max_contours is not None:
+        files = files[:max_contours]
     if not files:
         raise ValueError(f"No files matched {shadow_dir / 'merged-cont*'}")
     contours = [parse_merged_contour(p) for p in files]
@@ -255,16 +262,20 @@ def main() -> None:
         description="Interactive viewer: InitialModel in center + one merged contour projection with slider."
     )
     parser.add_argument(
-        "--model",
-        type=Path,
-        default=Path("data/InitialModel"),
-        help="Path to InitialModel file",
+        "--model-name",
+        type=str,
+        default="round",
+        # default="pear",
+        # default="princess",
+        # default="radiant",
+        # default="cushion",
+        help="Model folder name inside data/ (for example: round)",
     )
     parser.add_argument(
-        "--shadow-dir",
+        "--data-root",
         type=Path,
-        default=Path("data/shadow"),
-        help="Directory with merged-cont* files",
+        default=Path("data"),
+        help="Root directory with model folders",
     )
     parser.add_argument(
         "--distance-scale",
@@ -275,14 +286,17 @@ def main() -> None:
     parser.add_argument(
         "--max-contours",
         type=int,
-        default=200,
-        help="Use only first N merged-cont* files after sorting",
+        default=None,
+        help="Optional: use only first N merged-cont* files after sorting",
     )
     args = parser.parse_args()
 
+    model_path = args.data_root / args.model_name / "InitialModel"
+    shadow_dir = args.data_root / args.model_name / "shadow"
+
     build_viewer(
-        model_path=args.model,
-        shadow_dir=args.shadow_dir,
+        model_path=model_path,
+        shadow_dir=shadow_dir,
         distance_scale=args.distance_scale,
         max_contours=args.max_contours,
     )

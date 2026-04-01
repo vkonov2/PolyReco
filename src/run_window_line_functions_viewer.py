@@ -43,10 +43,86 @@ class ComputationResult:
     distances: np.ndarray  # (N-1,L,2)
 
 
+@dataclass(frozen=True)
+class PolyModel:
+    vertices: np.ndarray  # (N, 3)
+    faces: list[list[int]]
+
+
 def progress_iter(iterable, *, total: int | None, desc: str, use_tqdm: bool):
     if use_tqdm and tqdm is not None:
         return tqdm(iterable, total=total, desc=desc, leave=False)
     return iterable
+
+
+def parse_initial_model(path: Path) -> PolyModel:
+    raw = path.read_text(encoding="utf-8").splitlines()
+    lines = [ln.strip() for ln in raw if ln.strip()]
+
+    counts = None
+    for ln in lines:
+        if ln.startswith("#"):
+            continue
+        parts = ln.split()
+        if len(parts) == 3 and all(p.lstrip("-").isdigit() for p in parts):
+            counts = tuple(map(int, parts))
+            break
+    if counts is None:
+        raise ValueError(f"Cannot parse counts from {path}")
+    num_vertices, num_facets, _ = counts
+
+    try:
+        v_start = next(i for i, ln in enumerate(lines) if ln.lower().startswith("# vertices")) + 1
+    except StopIteration as exc:
+        raise ValueError(f"Cannot find vertices section in {path}") from exc
+
+    vertices = np.zeros((num_vertices, 3), dtype=float)
+    i = v_start
+    parsed_vertices = 0
+    while i < len(lines) and parsed_vertices < num_vertices:
+        ln = lines[i]
+        i += 1
+        if ln.startswith("#"):
+            continue
+        parts = ln.split()
+        if len(parts) != 4:
+            continue
+        vid = int(parts[0])
+        vertices[vid] = np.array([float(parts[1]), float(parts[2]), float(parts[3])], dtype=float)
+        parsed_vertices += 1
+
+    if parsed_vertices != num_vertices:
+        raise ValueError(f"Parsed {parsed_vertices} vertices, expected {num_vertices}")
+
+    try:
+        f_start = next(i for i, ln in enumerate(lines) if ln.lower().startswith("# facets")) + 1
+    except StopIteration as exc:
+        raise ValueError(f"Cannot find facets section in {path}") from exc
+
+    faces: list[list[int]] = []
+    i = f_start
+    while i < len(lines) and len(faces) < num_facets:
+        ln = lines[i]
+        i += 1
+        if ln.startswith("#"):
+            continue
+        parts = ln.split()
+        if len(parts) < 6:
+            continue
+        num_sides = int(parts[1])
+        vids: list[int] = []
+        while i < len(lines) and len(vids) < num_sides:
+            next_ln = lines[i]
+            i += 1
+            if next_ln.startswith("#"):
+                continue
+            vids.extend(int(tok) for tok in next_ln.split())
+        faces.append(vids[:num_sides])
+
+    if len(faces) != num_facets:
+        raise ValueError(f"Parsed {len(faces)} facets, expected {num_facets}")
+
+    return PolyModel(vertices=vertices, faces=faces)
 
 
 def parse_merged_contour(path: Path) -> ShadowContour:
@@ -88,7 +164,7 @@ def parse_merged_contour(path: Path) -> ShadowContour:
     return ShadowContour(index=contour_idx, normal=normal, points=pts)
 
 
-def sorted_contour_files(shadow_dir: Path, pattern: str, max_contours: int) -> list[Path]:
+def sorted_contour_files(shadow_dir: Path, pattern: str, max_contours: int | None) -> list[Path]:
     files = list(shadow_dir.glob(pattern))
     if not files:
         raise ValueError(f"No files matched {shadow_dir / pattern}")
@@ -100,7 +176,9 @@ def sorted_contour_files(shadow_dir: Path, pattern: str, max_contours: int) -> l
         return (int(m.group(1)), p.name)
 
     files = sorted(files, key=sort_key)
-    return files[:max_contours]
+    if max_contours is not None:
+        return files[:max_contours]
+    return files
 
 
 def global_z_grid(contours: list[ShadowContour], z_step: float) -> np.ndarray:
@@ -189,12 +267,18 @@ def interpolate_contour_on_z_grid(contour: ShadowContour, z_levels: np.ndarray) 
     return out
 
 
-def init_window_solver_context(contour_lr: np.ndarray, normals: np.ndarray, window_size: int) -> None:
+def init_window_solver_context(
+    contour_lr: np.ndarray,
+    normals: np.ndarray,
+    window_size: int,
+    window_mode: str,
+) -> None:
     global _WINDOW_SOLVER_CONTEXT
     _WINDOW_SOLVER_CONTEXT = {
         "contour_lr": contour_lr,
         "normals": normals,
         "window_size": int(window_size),
+        "window_mode": str(window_mode),
     }
 
 
@@ -205,12 +289,18 @@ def solve_single_window_points(ws: int) -> tuple[int, np.ndarray]:
     contour_lr = _WINDOW_SOLVER_CONTEXT["contour_lr"]
     normals = _WINDOW_SOLVER_CONTEXT["normals"]
     window_size = int(_WINDOW_SOLVER_CONTEXT["window_size"])
+    window_mode = str(_WINDOW_SOLVER_CONTEXT.get("window_mode", "non-cyclic"))
     assert isinstance(contour_lr, np.ndarray)
     assert isinstance(normals, np.ndarray)
 
     n_cont, n_levels = contour_lr.shape[0], contour_lr.shape[1]
     out = np.full((n_levels, 2, 3), np.nan, dtype=float)
-    idx_arr = np.array([(ws + j) % n_cont for j in range(window_size)], dtype=int)
+    if window_mode == "cyclic":
+        idx_arr = np.array([(ws + j) % n_cont for j in range(window_size)], dtype=int)
+    elif window_mode == "non-cyclic":
+        idx_arr = np.arange(ws, ws + window_size, dtype=int)
+    else:
+        raise ValueError(f"Unsupported window_mode: {window_mode}")
     window_normals = normals[idx_arr, :]
 
     for zi in range(n_levels):
@@ -264,15 +354,21 @@ def compute_result(
     n_cont = len(contours)
     if window_size > n_cont:
         raise ValueError("window_size must be <= number of contours")
+    window_mode = "non-cyclic"
+    n_windows = n_cont - window_size + 1
+    if n_windows < 1:
+        raise ValueError("No windows to compute; reduce window_size")
 
     z_levels = global_z_grid(contours, z_step)
     n_levels = z_levels.size
     LOG.info(
-        "Compute start: contours=%d, z_levels=%d, z_step=%.6f, window=%d, workers=%s",
+        "Compute start: contours=%d, z_levels=%d, z_step=%.6f, window=%d, mode=%s, windows=%d, workers=%s",
         n_cont,
         n_levels,
         z_step,
         window_size,
+        window_mode,
+        n_windows,
         "auto" if workers is None else workers,
     )
 
@@ -328,15 +424,15 @@ def compute_result(
                 contour_lr[ci, :, :, :] = interpolate_contour_on_z_grid(contour, z_levels)
 
     # For each sliding window start build a line (as points along z-levels) for left/right separately.
-    # shape (N,L,2,3)
-    line_points = np.full((n_cont, n_levels, 2, 3), np.nan, dtype=float)
+    # shape (W,L,2,3), W = number of windows
+    line_points = np.full((n_windows, n_levels, 2, 3), np.nan, dtype=float)
     normals = np.vstack([c.normal for c in contours])
 
     if resolved_workers == 1:
-        init_window_solver_context(contour_lr, normals, window_size)
+        init_window_solver_context(contour_lr, normals, window_size, window_mode)
         window_iter = progress_iter(
-            range(n_cont),
-            total=n_cont,
+            range(n_windows),
+            total=n_windows,
             desc="Solve sliding windows",
             use_tqdm=show_progress,
         )
@@ -349,13 +445,13 @@ def compute_result(
             with ProcessPoolExecutor(
                 max_workers=resolved_workers,
                 initializer=init_window_solver_context,
-                initargs=(contour_lr, normals, window_size),
+                initargs=(contour_lr, normals, window_size, window_mode),
             ) as ex:
-                future_to_idx = {ex.submit(solve_single_window_points, ws): ws for ws in range(n_cont)}
+                future_to_idx = {ex.submit(solve_single_window_points, ws): ws for ws in range(n_windows)}
                 completed = as_completed(future_to_idx)
                 completed = progress_iter(
                     completed,
-                    total=n_cont,
+                    total=n_windows,
                     desc="Solve sliding windows",
                     use_tqdm=show_progress,
                 )
@@ -367,10 +463,10 @@ def compute_result(
                 "Parallel sliding-window solve unavailable (%s). Falling back to sequential mode.",
                 exc,
             )
-            init_window_solver_context(contour_lr, normals, window_size)
+            init_window_solver_context(contour_lr, normals, window_size, window_mode)
             window_iter = progress_iter(
-                range(n_cont),
-                total=n_cont,
+                range(n_windows),
+                total=n_windows,
                 desc="Solve sliding windows (fallback)",
                 use_tqdm=show_progress,
             )
@@ -378,9 +474,9 @@ def compute_result(
                 _, ws_points = solve_single_window_points(ws)
                 line_points[ws, :, :, :] = ws_points
 
-    # Distances between neighboring windows, non-cyclic: 0..N-2 (199 values for N=200)
-    distances = np.full((n_cont - 1, n_levels, 2), np.nan, dtype=float)
-    for i in range(n_cont - 1):
+    # Distances between neighboring windows i -> i+1
+    distances = np.full((max(0, n_windows - 1), n_levels, 2), np.nan, dtype=float)
+    for i in range(max(0, n_windows - 1)):
         dxyz = line_points[i + 1, :, :, :] - line_points[i, :, :, :]
         distances[i, :, :] = np.linalg.norm(dxyz, axis=2)
 
@@ -406,6 +502,8 @@ def build_viewer(
         "window": int(window_default),
         "side": 0,  # 0 left, 1 right
         "z_idx": 0,
+        "trim_bottom": 2,
+        "trim_top": 20,
     }
 
     result = compute_result(
@@ -415,6 +513,12 @@ def build_viewer(
         show_progress=True,
         workers=workers,
     )
+    if params["trim_bottom"] < 0 or params["trim_top"] < 0:
+        raise ValueError("trim_bottom and trim_top must be >= 0")
+    if params["trim_bottom"] + params["trim_top"] >= result.z_levels.size:
+        raise ValueError(
+            "Too many trimmed Z levels: bottom+top must be less than number of Z levels"
+        )
 
     fig = plt.figure(figsize=(12, 7))
     ax = fig.add_subplot(111)
@@ -431,8 +535,14 @@ def build_viewer(
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.7, "edgecolor": "#cccccc"},
     )
 
+    def z_slider_bounds() -> tuple[int, int]:
+        lo = int(params["trim_bottom"])
+        hi = result.z_levels.size - 1 - int(params["trim_top"])
+        return lo, hi
+
     def update_plot() -> None:
-        z_idx = int(np.clip(params["z_idx"], 0, result.z_levels.size - 1))
+        z_lo, z_hi = z_slider_bounds()
+        z_idx = int(np.clip(params["z_idx"], z_lo, z_hi))
         params["z_idx"] = z_idx
         side = int(params["side"])
 
@@ -461,7 +571,7 @@ def build_viewer(
         z_val = float(result.z_levels[z_idx])
         ax.set_title(
             "Distance Function Between Neighbor Sliding Windows"
-            f" | side={side_name} | z={z_val:.6f} | step={params['z_step']:.5f} | window={params['window']}"
+            f" | mode=non-cyclic | side={side_name} | z={z_val:.6f} | step={params['z_step']:.5f} | window={params['window']}"
         )
         ax.set_xlabel("Window transition index i (distance between windows i and i+1)")
         ax.set_ylabel("Distance")
@@ -469,11 +579,39 @@ def build_viewer(
 
         info_text.set_text(
             f"N_contours={len(contours)}\n"
+            f"N_windows={result.line_points.shape[0]}, N_dist={result.distances.shape[0]}\n"
             f"N_z_levels={result.z_levels.size}\n"
+            f"visible_z_idx=[{z_lo}, {z_hi}] (trim bottom={params['trim_bottom']}, top={params['trim_top']})\n"
             f"z_min={result.z_levels[0]:.6f}, z_max={result.z_levels[-1]:.6f}"
         )
 
         fig.canvas.draw_idle()
+
+    def refresh_z_slider() -> None:
+        z_lo, z_hi = z_slider_bounds()
+        if z_lo > z_hi:
+            raise ValueError(
+                "Too many trimmed Z levels for current z-step: "
+                "bottom+top must be less than number of Z levels"
+            )
+        params["z_idx"] = int(np.clip(params["z_idx"], z_lo, z_hi))
+
+        nonlocal z_slider
+        z_ax.clear()
+        z_slider = Slider(
+            ax=z_ax,
+            label="Z level index",
+            valmin=z_lo,
+            valmax=z_hi,
+            valinit=params["z_idx"],
+            valstep=1,
+        )
+
+        def on_z(val: float) -> None:
+            params["z_idx"] = int(val)
+            update_plot()
+
+        z_slider.on_changed(on_z)
 
     def recompute() -> None:
         nonlocal result
@@ -489,38 +627,12 @@ def build_viewer(
             show_progress=True,
             workers=workers,
         )
-        # keep previous z-value intent, clamp by new level count
-        params["z_idx"] = int(np.clip(params["z_idx"], 0, result.z_levels.size - 1))
-
-        # Replace z slider with updated bounds
-        nonlocal z_slider
-        z_ax.clear()
-        z_slider = Slider(
-            ax=z_ax,
-            label="Z level index",
-            valmin=0,
-            valmax=max(1, result.z_levels.size - 1),
-            valinit=params["z_idx"],
-            valstep=1,
-        )
-
-        def on_z(val: float) -> None:
-            params["z_idx"] = int(val)
-            update_plot()
-
-        z_slider.on_changed(on_z)
+        refresh_z_slider()
         update_plot()
 
     # Controls
     z_ax = fig.add_axes([0.15, 0.06, 0.62, 0.03])
-    z_slider = Slider(
-        ax=z_ax,
-        label="Z level index",
-        valmin=0,
-        valmax=max(1, result.z_levels.size - 1),
-        valinit=0,
-        valstep=1,
-    )
+    z_slider = None
 
     step_ax = fig.add_axes([0.15, 0.02, 0.62, 0.03])
     step_slider = Slider(
@@ -536,6 +648,10 @@ def build_viewer(
     side_radio = RadioButtons(side_ax, ("Left", "Right"), active=0)
     win_box_ax = fig.add_axes([0.80, 0.64, 0.17, 0.05])
     win_box = TextBox(win_box_ax, "Window", initial=str(params["window"]))
+    trim_bottom_ax = fig.add_axes([0.80, 0.57, 0.17, 0.05])
+    trim_bottom_box = TextBox(trim_bottom_ax, "Trim bottom", initial=str(params["trim_bottom"]))
+    trim_top_ax = fig.add_axes([0.80, 0.50, 0.17, 0.05])
+    trim_top_box = TextBox(trim_top_ax, "Trim top", initial=str(params["trim_top"]))
 
     def on_z(val: float) -> None:
         params["z_idx"] = int(val)
@@ -574,12 +690,66 @@ def build_viewer(
         params["window"] = w
         recompute()
 
-    z_slider.on_changed(on_z)
+    def on_trim_bottom_submit(text: str) -> None:
+        raw = text.strip()
+        prev = int(params["trim_bottom"])
+        try:
+            val = int(raw)
+        except ValueError:
+            LOG.warning("Trim bottom must be integer, got '%s'", raw)
+            trim_bottom_box.set_val(str(prev))
+            return
+        if val < 0:
+            LOG.warning("Trim bottom must be >= 0, got %d", val)
+            trim_bottom_box.set_val(str(prev))
+            return
+        if val + int(params["trim_top"]) >= result.z_levels.size:
+            LOG.warning(
+                "Trim bottom + top must be < number of levels (%d), got %d + %d",
+                result.z_levels.size,
+                val,
+                int(params["trim_top"]),
+            )
+            trim_bottom_box.set_val(str(prev))
+            return
+        params["trim_bottom"] = val
+        refresh_z_slider()
+        update_plot()
+
+    def on_trim_top_submit(text: str) -> None:
+        raw = text.strip()
+        prev = int(params["trim_top"])
+        try:
+            val = int(raw)
+        except ValueError:
+            LOG.warning("Trim top must be integer, got '%s'", raw)
+            trim_top_box.set_val(str(prev))
+            return
+        if val < 0:
+            LOG.warning("Trim top must be >= 0, got %d", val)
+            trim_top_box.set_val(str(prev))
+            return
+        if int(params["trim_bottom"]) + val >= result.z_levels.size:
+            LOG.warning(
+                "Trim bottom + top must be < number of levels (%d), got %d + %d",
+                result.z_levels.size,
+                int(params["trim_bottom"]),
+                val,
+            )
+            trim_top_box.set_val(str(prev))
+            return
+        params["trim_top"] = val
+        refresh_z_slider()
+        update_plot()
+
     side_radio.on_clicked(on_side)
     step_slider.on_changed(on_step)
     win_box.on_submit(on_window_submit)
+    trim_bottom_box.on_submit(on_trim_bottom_submit)
+    trim_top_box.on_submit(on_trim_top_submit)
 
     fig.subplots_adjust(left=0.06, right=0.77, top=0.94, bottom=0.16)
+    refresh_z_slider()
     update_plot()
     plt.show()
 
@@ -592,10 +762,26 @@ def main() -> None:
         )
     )
     parser.add_argument(
+        "--model-name",
+        type=str,
+        default="round",
+        # default="pear",
+        # default="princess",
+        # default="radiant",
+        # default="cushion",
+        help="Model folder name inside data/ (for example: round)",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("data"),
+        help="Root directory with model folders",
+    )
+    parser.add_argument(
         "--shadow-dir",
         type=Path,
-        default=Path("data/shadow"),
-        help="Directory with merged contours",
+        default=None,
+        help="Optional override for contour directory; if omitted uses data-root/model-name/shadow",
     )
     parser.add_argument(
         "--pattern",
@@ -606,8 +792,8 @@ def main() -> None:
     parser.add_argument(
         "--max-contours",
         type=int,
-        default=200,
-        help="Use first N contours after numeric sorting",
+        default=None,
+        help="Optional: use only first N contours after numeric sorting (default: all)",
     )
     parser.add_argument(
         "--z-step",
@@ -633,13 +819,26 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
+    model_path = args.data_root / args.model_name / "InitialModel"
+    if args.shadow_dir is None:
+        shadow_dir = args.data_root / args.model_name / "shadow"
+    else:
+        shadow_dir = args.shadow_dir
+
+    model = parse_initial_model(model_path)
     LOG.info(
-        "Loading contours from %s with pattern=%s, max=%d",
-        args.shadow_dir,
-        args.pattern,
-        args.max_contours,
+        "Model '%s': vertices=%d, faces=%d",
+        args.model_name,
+        model.vertices.shape[0],
+        len(model.faces),
     )
-    files = sorted_contour_files(args.shadow_dir, args.pattern, args.max_contours)
+    LOG.info(
+        "Loading contours from %s with pattern=%s, max=%s",
+        shadow_dir,
+        args.pattern,
+        "all" if args.max_contours is None else str(args.max_contours),
+    )
+    files = sorted_contour_files(shadow_dir, args.pattern, args.max_contours)
     load_iter = progress_iter(
         files,
         total=len(files),
