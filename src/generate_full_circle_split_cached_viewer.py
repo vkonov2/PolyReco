@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover
     tqdm = None
 
 EPS = 1e-9
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -204,6 +204,51 @@ def unique_edges_from_faces(faces: list[list[int]]) -> np.ndarray:
     if not edges:
         return np.zeros((0, 2), dtype=np.int32)
     return np.array(sorted(edges), dtype=np.int32)
+
+
+def polyhedron_center_of_mass(vertices: np.ndarray, faces: list[list[int]]) -> np.ndarray:
+    if not faces:
+        return vertices.mean(axis=0)
+
+    # Use original polygonal facets from InitialModel.
+    # We orient each facet consistently relative to an inner reference point,
+    # then integrate tetrahedra fan-wise inside each facet.
+    ref_inside = vertices.mean(axis=0)
+    sum_v6 = 0.0
+    weighted = np.zeros(3, dtype=float)
+    sum_w = 0.0
+    weighted_abs = np.zeros(3, dtype=float)
+
+    for face in faces:
+        if len(face) < 3:
+            continue
+        pts = vertices[np.array(face, dtype=int)]
+        if pts.shape[0] < 3:
+            continue
+
+        area_vec = np.zeros(3, dtype=float)
+        for i in range(pts.shape[0]):
+            area_vec += np.cross(pts[i], pts[(i + 1) % pts.shape[0]])
+        face_cent = pts.mean(axis=0)
+        if float(np.dot(area_vec, face_cent - ref_inside)) < 0.0:
+            pts = pts[::-1].copy()
+
+        p0 = pts[0]
+        for i in range(1, pts.shape[0] - 1):
+            p1 = pts[i]
+            p2 = pts[i + 1]
+            v6 = float(np.dot(p0, np.cross(p1, p2)))
+            sum_v6 += v6
+            weighted += (p0 + p1 + p2) * v6
+            w = abs(v6)
+            sum_w += w
+            weighted_abs += (p0 + p1 + p2) * w
+
+    if abs(sum_v6) > EPS:
+        return weighted / (4.0 * sum_v6)
+    if sum_w > EPS:
+        return weighted_abs / (4.0 * sum_w)
+    return vertices.mean(axis=0)
 
 
 def lateral_axis_for_normal(direction: np.ndarray) -> np.ndarray:
@@ -521,24 +566,16 @@ def build_model_cache(
     contours = [parse_merged_contour(p) for p in contour_files]
 
     vertices = model.vertices
-    model_center = vertices.mean(axis=0)
+    model_center = polyhedron_center_of_mass(vertices, model.faces)
     centered_vertices = vertices - model_center
     model_radius = float(np.linalg.norm(centered_vertices, axis=1).max())
 
-    if cut_x_mode == "model-center":
-        split_line_point_world = np.array(
-            [float(model_center[0] + cut_x_offset), float(model_center[1]), float(model_center[2])],
-            dtype=float,
-        )
-    elif cut_x_mode == "bbox-mid":
-        x_min = float(np.min(vertices[:, 0]))
-        x_max = float(np.max(vertices[:, 0]))
-        split_line_point_world = np.array(
-            [0.5 * (x_min + x_max) + float(cut_x_offset), float(model_center[1]), float(model_center[2])],
-            dtype=float,
-        )
-    else:
-        raise ValueError(f"Unsupported cut_x_mode: {cut_x_mode}")
+    # Always split by projection of a vertical line that passes through
+    # the model center of mass.
+    split_line_point_world = np.array(
+        [float(model_center[0]), float(model_center[1]), float(model_center[2])],
+        dtype=float,
+    )
     split_line_dir_world = np.array([0.0, 0.0, 1.0], dtype=float)
 
     half_contours = build_half_contours(
@@ -1688,8 +1725,8 @@ def build_cache_payload(
         "schema_version": CACHE_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "distance_scale": float(distance_scale),
-        "cut_x_mode": str(cut_x_mode),
-        "cut_x_offset": float(cut_x_offset),
+        "cut_x_mode": "model-center",
+        "cut_x_offset": 0.0,
         "models": {},
     }
 
@@ -1994,6 +2031,11 @@ def main() -> None:
     )
     args = parser.parse_args()
     use_progress = not args.no_progress
+    if args.cut_x_mode != "model-center" or abs(float(args.cut_x_offset)) > 0.0:
+        print(
+            "[warn] cut-x parameters are ignored; split line is always through model center of mass.",
+            flush=True,
+        )
 
     explicit_models = [m.strip() for m in args.models.split(",") if m.strip()] or None
 
