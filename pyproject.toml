@@ -13,3 +13,4 @@ dependencies = [
 
 [project.scripts]
 window-line-functions-viewer = "run_window_line_functions_viewer:main"
+full-circle-split-viewer = "generate_full_circle_split_cached_viewer:main"
