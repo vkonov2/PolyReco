@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover
     tqdm = None
 
 EPS = 1e-9
-CACHE_SCHEMA_VERSION = 9
+CACHE_SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -249,6 +249,18 @@ def polyhedron_center_of_mass(vertices: np.ndarray, faces: list[list[int]]) -> n
     if sum_w > EPS:
         return weighted_abs / (4.0 * sum_w)
     return vertices.mean(axis=0)
+
+
+def top_points_vertical_axis_point(vertices: np.ndarray, atol: float = 1e-9) -> np.ndarray:
+    if vertices.size == 0:
+        return np.zeros(3, dtype=float)
+    max_z = float(np.max(vertices[:, 2]))
+    mask = np.isclose(vertices[:, 2], max_z, rtol=0.0, atol=atol)
+    if not np.any(mask):
+        idx = int(np.argmax(vertices[:, 2]))
+        return vertices[idx].astype(float)
+    top_pts = vertices[mask]
+    return np.mean(top_pts, axis=0).astype(float)
 
 
 def lateral_axis_for_normal(direction: np.ndarray) -> np.ndarray:
@@ -570,10 +582,11 @@ def build_model_cache(
     centered_vertices = vertices - model_center
     model_radius = float(np.linalg.norm(centered_vertices, axis=1).max())
 
-    # Always split by projection of a vertical line that passes through
-    # the model center of mass.
+    # Split by projection of a vertical line passing through the averaged
+    # highest point(s) of the model.
+    top_axis_point = top_points_vertical_axis_point(vertices)
     split_line_point_world = np.array(
-        [float(model_center[0]), float(model_center[1]), float(model_center[2])],
+        [float(top_axis_point[0]), float(top_axis_point[1]), float(top_axis_point[2])],
         dtype=float,
     )
     split_line_dir_world = np.array([0.0, 0.0, 1.0], dtype=float)
@@ -656,20 +669,22 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 8px 24px rgba(20,33,61,0.06); }
     .field { display: grid; gap: 5px; }
     .field label { font-size: 12px; color: var(--muted); }
-    .field input, .field select { width: 100%; }
+    .field input:not([type=\"checkbox\"]):not([type=\"radio\"]), .field select { width: 100%; }
+    .checkline { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .checkline input[type=\"checkbox\"] { width: auto; margin: 0; }
     .top-row { display: grid; grid-template-columns: 1fr; padding: 10px 12px; }
     .top-main { display: grid; grid-template-columns: 1fr 260px; gap: 10px; align-items: stretch; }
     .plot { min-height: 200px; border-radius: 12px; overflow: hidden; }
     .side-controls { padding: 10px; display: grid; gap: 10px; align-content: start; }
     .bottom-main { display: grid; grid-template-columns: 1fr 260px; gap: 10px; align-items: stretch; }
-    .stack { display: grid; grid-template-rows: 1.8fr 0.55fr; gap: 10px; }
+    .stack { display: grid; grid-template-rows: 1.75fr 0.85fr; gap: 10px; }
     .params { padding: 10px; display: grid; gap: 9px; align-content: start; }
     .z-wide { padding: 10px 12px; }
     .small { font-size: 12px; color: var(--muted); }
     @media (max-width: 1100px) {
       .top-main { grid-template-columns: 1fr; }
       .bottom-main { grid-template-columns: 1fr; }
-      .stack { grid-template-rows: 54vh 28vh; }
+      .stack { grid-template-rows: 52vh 32vh; }
     }
   </style>
 </head>
@@ -708,7 +723,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     <div class=\"bottom-main\">
       <div class=\"stack\">
         <div id=\"contextPlot\" class=\"panel plot\" style=\"height:62vh;\"></div>
-        <div id=\"fnPlot\" class=\"panel plot\" style=\"height:24vh;\"></div>
+        <div id=\"fnPlot\" class=\"panel plot\" style=\"height:32vh;\"></div>
       </div>
       <div class=\"panel params\">
         <div class=\"field\">
@@ -737,6 +752,17 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           <div class=\"small\">Размер скользящего окна по контурам. Больше: сильнее сглаживание. Меньше: больше локальных колебаний.</div>
         </div>
         <div class=\"field\">
+          <label for=\"rmsMinPctInput\">RMS minima threshold (%)</label>
+          <input id=\"rmsMinPctInput\" type=\"number\" min=\"0\" max=\"100\" step=\"0.5\" value=\"10\" />
+          <div class=\"small\">Показывать локальные минимумы RMS не выше чем global_min + (max-min)*pct/100.</div>
+        </div>
+        <div class=\"field\">
+          <label>Section visibility</label>
+          <label class=\"checkline\"><input id=\"showRedSectionChk\" type=\"checkbox\" checked />Red section</label>
+          <label class=\"checkline\"><input id=\"showYellowSectionChk\" type=\"checkbox\" checked />Yellow minima section + points</label>
+          <div class=\"small\">Управление отображением сечений на 3D-сцене.</div>
+        </div>
+        <div class=\"field\">
           <label for=\"trimBottom\">Trim bottom</label>
           <input id=\"trimBottom\" type=\"number\" min=\"0\" value=\"2\" />
           <div class=\"small\">Сколько нижних Z-уровней скрыть в ползунке и графике.</div>
@@ -757,6 +783,8 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
         <div class=\"small\">Текущий срез по Z, для которого строится функция расстояний.</div>
       </div>
     </div>
+
+    <div id=\"allMinimaPlot\" class=\"panel plot\" style=\"height:80vh;\"></div>
   </div>
 
   <script id=\"cacheData\" type=\"application/json\">__CACHE_JSON__</script>
@@ -946,14 +974,23 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       projection: 'perspective',
       topCamera: null,
       contextCamera: null,
+      allMinimaCameraLeft: null,
+      allMinimaCameraRight: null,
       zoomAbs: 1.0,
       zStep: 0.01,
       window: 10,
+      rmsMinPct: 10.0,
+      showRedSection: true,
+      showYellowSection: true,
       zIdx: 0,
       trimBottom: 2,
       trimTop: 20,
       hoveredDistIdx: null,
       computed: null,
+      rmsMinimaCacheKey: null,
+      rmsMinimaCache: null,
+      allMinimaCloudCacheKey: null,
+      allMinimaCloudCache: null,
     };
 
     const modelSel = document.getElementById('modelSel');
@@ -965,10 +1002,14 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     const zoomAbsLabel2 = document.getElementById('zoomAbsLabel2');
     const zStepInput = document.getElementById('zStepInput');
     const windowInput = document.getElementById('windowInput');
+    const rmsMinPctInput = document.getElementById('rmsMinPctInput');
+    const showRedSectionChk = document.getElementById('showRedSectionChk');
+    const showYellowSectionChk = document.getElementById('showYellowSectionChk');
     const zIdx = document.getElementById('zIdx');
     const trimBottom = document.getElementById('trimBottom');
     const trimTop = document.getElementById('trimTop');
     const status = document.getElementById('status');
+    const allMinimaPlot = document.getElementById('allMinimaPlot');
     const viewXBtn = document.getElementById('viewXBtn');
     const viewYBtn = document.getElementById('viewYBtn');
     const viewZBtn = document.getElementById('viewZBtn');
@@ -1047,13 +1088,19 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
 
       const z = decodeArray(fn.z_levels);
       const d = decodeArray(fn.distances);
+      const r = fn.fit_rms ? decodeArray(fn.fit_rms) : null;
+      const lp = fn.line_points ? decodeArray(fn.line_points) : null;
       const zLevels = z.data;
       const distances = d.data;
+      const fitRms = r ? r.data : null;
+      const linePoints = lp ? lp.data : null;
       const nLevels = Number(z.shape && z.shape[0] ? z.shape[0] : zLevels.length);
       const nHalf = Number(d.shape && d.shape[0] ? d.shape[0] : 0);
       const out = {
         zLevels,
         distances,
+        fitRms,
+        linePoints,
         nLevels,
         nHalf,
         zStep: Number(fn.z_step || pm.z_step || PRECOMPUTED.z_step || state.zStep),
@@ -1378,9 +1425,15 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           nLevels: pre.nLevels,
           nWindows: pre.nHalf,
           distances: pre.distances,
+          fitRms: pre.fitRms,
+          linePoints: pre.linePoints || null,
           source: 'precomputed',
         };
         state.hoveredDistIdx = null;
+        state.rmsMinimaCacheKey = null;
+        state.rmsMinimaCache = null;
+        state.allMinimaCloudCacheKey = null;
+        state.allMinimaCloudCache = null;
         state.zIdx = Math.max(0, Math.min(state.zIdx, pre.nLevels - 1));
         projIdx.max = String(Math.max(0, nHalf - 1));
         return;
@@ -1404,6 +1457,8 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
 
       const linePoints = new Float32Array(nHalf * nLevels * 3);
       linePoints.fill(NaN);
+      const fitRms = new Float32Array(nHalf * nLevels);
+      fitRms.fill(NaN);
 
       for (let ws = 0; ws < nHalf; ws++) {
         for (let zi = 0; zi < nLevels; zi++) {
@@ -1424,6 +1479,30 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           linePoints[outOff] = x[0];
           linePoints[outOff + 1] = x[1];
           linePoints[outOff + 2] = x[2];
+
+          if (Number.isFinite(x[0]) && Number.isFinite(x[1]) && Number.isFinite(x[2])) {
+            let sse = 0.0;
+            let cnt = 0;
+            for (let k = 0; k < candPoints.length; k++) {
+              const p = candPoints[k];
+              const d = candDirs[k];
+              const dn = Math.hypot(d[0], d[1], d[2]);
+              if (dn <= EPS) continue;
+              const ux = d[0] / dn;
+              const uy = d[1] / dn;
+              const uz = d[2] / dn;
+              const vx = x[0] - p[0];
+              const vy = x[1] - p[1];
+              const vz = x[2] - p[2];
+              const dot = vx * ux + vy * uy + vz * uz;
+              const px = vx - dot * ux;
+              const py = vy - dot * uy;
+              const pz = vz - dot * uz;
+              sse += px * px + py * py + pz * pz;
+              cnt += 1;
+            }
+            if (cnt > 0) fitRms[ws * nLevels + zi] = Math.sqrt(sse / cnt);
+          }
         }
       }
 
@@ -1450,10 +1529,16 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
         nLevels,
         nWindows: nHalf,
         distances,
+        fitRms,
+        linePoints,
         source: 'dynamic',
       };
 
       state.hoveredDistIdx = null;
+      state.rmsMinimaCacheKey = null;
+      state.rmsMinimaCache = null;
+      state.allMinimaCloudCacheKey = null;
+      state.allMinimaCloudCache = null;
       state.zIdx = Math.max(0, Math.min(state.zIdx, nLevels - 1));
       projIdx.max = String(Math.max(0, nHalf - 1));
     }
@@ -1504,12 +1589,269 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       }, {responsive: true, displaylogo: false});
     }
 
-    function extractYAtZ(zIndex) {
+    function extractYAtZ(zIndex, keyName) {
       const y = new Array(state.computed.nWindows);
+      const src = state.computed[keyName];
       for (let i = 0; i < state.computed.nWindows; i++) {
-        y[i] = state.computed.distances[i * state.computed.nLevels + zIndex];
+        y[i] = src ? src[i * state.computed.nLevels + zIndex] : NaN;
       }
       return y;
+    }
+
+    function finite3(p) {
+      return (
+        Array.isArray(p) &&
+        p.length >= 3 &&
+        Number.isFinite(p[0]) &&
+        Number.isFinite(p[1]) &&
+        Number.isFinite(p[2])
+      );
+    }
+
+    function linePointsAtZ(zIndex) {
+      const m = ensureModelDecoded(state.modelName);
+      const nHalf = state.computed.nWindows;
+      const zSafe = Math.max(0, Math.min(state.computed.nLevels - 1, Number(zIndex) || 0));
+      const cx = Array.isArray(m.model_center) ? Number(m.model_center[0] || 0) : 0;
+      const cy = Array.isArray(m.model_center) ? Number(m.model_center[1] || 0) : 0;
+      const cz = Array.isArray(m.model_center) ? Number(m.model_center[2] || 0) : 0;
+      const src = state.computed.linePoints;
+      if (src) {
+        const out = new Array(nHalf);
+        for (let i = 0; i < nHalf; i++) {
+          const off = (i * state.computed.nLevels + zSafe) * 3;
+          out[i] = [src[off] - cx, src[off + 1] - cy, src[off + 2] - cz];
+        }
+        return out;
+      }
+
+      const halves = m.half_contours;
+      const window = Math.max(2, Math.min(nHalf, Math.round(Number(state.window) || 2)));
+      const zLevel = Number(state.computed.zLevels[zSafe]);
+      const halfAtZ = new Array(nHalf);
+      for (let hi = 0; hi < nHalf; hi++) {
+        const hp = halves[hi].points_calc || halves[hi].points;
+        halfAtZ[hi] = halfContourPointAtZ(hp, zLevel);
+      }
+
+      const out = new Array(nHalf);
+      for (let ws = 0; ws < nHalf; ws++) {
+        const candPoints = [];
+        const candDirs = [];
+        for (let j = 0; j < window; j++) {
+          const idx = (ws + j) % nHalf;
+          const p = halfAtZ[idx];
+          if (finite3(p)) {
+            candPoints.push(p);
+            candDirs.push(halves[idx].normal_calc || halves[idx].normal);
+          }
+        }
+        if (candPoints.length >= 2) {
+          const p = closestPointToLines(candPoints, candDirs);
+          out[ws] = [p[0] - cx, p[1] - cy, p[2] - cz];
+        } else {
+          out[ws] = [NaN, NaN, NaN];
+        }
+      }
+      return out;
+    }
+
+    function computeRmsMinimaSelection() {
+      const empty = {
+        indices: [],
+        values: [],
+        points: [],
+        globalMin: NaN,
+        globalMax: NaN,
+        amplitude: NaN,
+        threshold: NaN,
+      };
+      if (!state.computed || !state.computed.fitRms) return empty;
+
+      const yFit = extractYAtZ(state.zIdx, 'fitRms');
+      const n = yFit.length;
+      if (n < 3) return empty;
+
+      let globalMin = Infinity;
+      let globalMax = -Infinity;
+      for (let i = 0; i < n; i++) {
+        const v = yFit[i];
+        if (!Number.isFinite(v)) continue;
+        if (v < globalMin) globalMin = v;
+        if (v > globalMax) globalMax = v;
+      }
+      if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax)) return empty;
+
+      const amplitude = Math.max(0, globalMax - globalMin);
+      const pct = Math.max(0, Number(state.rmsMinPct) || 0);
+      const threshold = globalMin + amplitude * (pct / 100.0);
+
+      const minimaIdx = [];
+      const minimaVal = [];
+      for (let i = 0; i < n; i++) {
+        const cur = yFit[i];
+        if (!Number.isFinite(cur)) continue;
+        const prev = yFit[(i - 1 + n) % n];
+        const next = yFit[(i + 1) % n];
+        if (!Number.isFinite(prev) || !Number.isFinite(next)) continue;
+        const isLocal = cur <= prev && cur <= next && (cur < prev || cur < next);
+        if (!isLocal) continue;
+        if (cur <= threshold + 1e-12) {
+          minimaIdx.push(i);
+          minimaVal.push(cur);
+        }
+      }
+
+      if (minimaIdx.length === 0) {
+        return { ...empty, globalMin, globalMax, amplitude, threshold };
+      }
+
+      const allPoints = linePointsAtZ(state.zIdx);
+      const minimaPoints = [];
+      const outIdx = [];
+      const outVal = [];
+      for (let k = 0; k < minimaIdx.length; k++) {
+        const i = minimaIdx[k];
+        const p = allPoints[i];
+        if (!finite3(p)) continue;
+        outIdx.push(i);
+        outVal.push(minimaVal[k]);
+        minimaPoints.push([p[0], p[1], p[2]]);
+      }
+
+      return {
+        indices: outIdx,
+        values: outVal,
+        points: minimaPoints,
+        globalMin,
+        globalMax,
+        amplitude,
+        threshold,
+      };
+    }
+
+    function currentRmsMinimaSelection() {
+      if (!state.computed) {
+        state.rmsMinimaCacheKey = null;
+        state.rmsMinimaCache = null;
+        return computeRmsMinimaSelection();
+      }
+      const key = [
+        state.modelName,
+        state.computed.source || 'dynamic',
+        state.window,
+        state.zIdx,
+        Number(state.rmsMinPct).toFixed(4),
+        state.computed.nLevels,
+        state.computed.nWindows,
+      ].join('|');
+      if (state.rmsMinimaCacheKey === key && state.rmsMinimaCache) return state.rmsMinimaCache;
+      state.rmsMinimaCacheKey = key;
+      state.rmsMinimaCache = computeRmsMinimaSelection();
+      return state.rmsMinimaCache;
+    }
+
+    function computeAllRmsMinimaCloud() {
+      const empty = { points: [], text: [] };
+      if (!state.computed || !state.computed.fitRms) return empty;
+      const m = ensureModelDecoded(state.modelName);
+      const fit = state.computed.fitRms;
+      const lp = state.computed.linePoints || null;
+      const nLevels = state.computed.nLevels;
+      const nHalf = state.computed.nWindows;
+      const pct = Math.max(0, Number(state.rmsMinPct) || 0);
+      const cx = Array.isArray(m.model_center) ? Number(m.model_center[0] || 0) : 0;
+      const cy = Array.isArray(m.model_center) ? Number(m.model_center[1] || 0) : 0;
+      const cz = Array.isArray(m.model_center) ? Number(m.model_center[2] || 0) : 0;
+
+      const points = [];
+      const text = [];
+      let fallbackZ = null;
+      for (let zi = 0; zi < nLevels; zi++) {
+        let gMin = Infinity;
+        let gMax = -Infinity;
+        const y = new Array(nHalf);
+        for (let i = 0; i < nHalf; i++) {
+          const v = fit[i * nLevels + zi];
+          y[i] = v;
+          if (!Number.isFinite(v)) continue;
+          if (v < gMin) gMin = v;
+          if (v > gMax) gMax = v;
+        }
+        if (!Number.isFinite(gMin) || !Number.isFinite(gMax)) continue;
+        const threshold = gMin + Math.max(0, gMax - gMin) * (pct / 100.0);
+
+        if (!lp) fallbackZ = linePointsAtZ(zi);
+        for (let i = 0; i < nHalf; i++) {
+          const cur = y[i];
+          if (!Number.isFinite(cur)) continue;
+          const prev = y[(i - 1 + nHalf) % nHalf];
+          const next = y[(i + 1) % nHalf];
+          if (!Number.isFinite(prev) || !Number.isFinite(next)) continue;
+          const isLocal = cur <= prev && cur <= next && (cur < prev || cur < next);
+          if (!isLocal || cur > threshold + 1e-12) continue;
+
+          let p;
+          if (lp) {
+            const off = (i * nLevels + zi) * 3;
+            p = [lp[off] - cx, lp[off + 1] - cy, lp[off + 2] - cz];
+          } else {
+            p = fallbackZ ? fallbackZ[i] : null;
+          }
+          if (!finite3(p)) continue;
+          points.push(p);
+          text.push(`z_idx=${zi}, i=${i}, rms=${Number(cur).toFixed(6)}`);
+        }
+      }
+      return { points, text };
+    }
+
+    function currentAllRmsMinimaCloud() {
+      if (!state.computed) {
+        state.allMinimaCloudCacheKey = null;
+        state.allMinimaCloudCache = null;
+        return computeAllRmsMinimaCloud();
+      }
+      const key = [
+        state.modelName,
+        state.computed.source || 'dynamic',
+        state.window,
+        Number(state.rmsMinPct).toFixed(4),
+        state.computed.nLevels,
+        state.computed.nWindows,
+      ].join('|');
+      if (state.allMinimaCloudCacheKey === key && state.allMinimaCloudCache) return state.allMinimaCloudCache;
+      state.allMinimaCloudCacheKey = key;
+      state.allMinimaCloudCache = computeAllRmsMinimaCloud();
+      return state.allMinimaCloudCache;
+    }
+
+    function minimaPointsTrace(points, indices, values) {
+      return {
+        type: 'scatter3d',
+        mode: 'markers',
+        x: points.map(p => p[0]),
+        y: points.map(p => p[1]),
+        z: points.map(p => p[2]),
+        marker: { size: 5, color: '#ffd166', line: { color: '#8a5a00', width: 1.2 } },
+        text: indices.map((i, k) => `i=${i}, rms=${Number(values[k]).toFixed(6)}`),
+        hovertemplate: '%{text}<extra>RMS minima</extra>',
+        showlegend: false,
+      };
+    }
+
+    function minimaCloudTrace(points, text) {
+      return {
+        type: 'scatter3d',
+        mode: 'markers',
+        x: points.map(p => p[0]),
+        y: points.map(p => p[1]),
+        z: points.map(p => p[2]),
+        marker: { size: 2.7, color: '#1d4ed8', opacity: 0.95 },
+        text,
+        hovertemplate: '%{text}<extra>All RMS minima</extra>',
+        showlegend: false,
+      };
     }
 
     function activeHalfIndices() {
@@ -1531,8 +1873,13 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       }
       const active = activeHalfIndices();
       const sectionObj = sectionTrace(m, zVal);
-      const data = [meshTrace(m), edgeTrace(m), cutLineTrace(m), zPlaneTrace(m, zVal), sectionObj.line];
+      const data = [meshTrace(m), edgeTrace(m), cutLineTrace(m), zPlaneTrace(m, zVal)];
+      if (state.showRedSection) data.push(sectionObj.line);
       for (const ci of active.out) data.push(contourLineTrace(m.half_contours[ci].points, '#ef476f', 5));
+      const minima = currentRmsMinimaSelection();
+      if (state.showYellowSection) {
+        if (minima.points.length > 0) data.push(minimaPointsTrace(minima.points, minima.indices, minima.values));
+      }
       const annotations = oppositeSideAnnotation(m, active.out, sectionObj.nGon);
 
       Plotly.react('contextPlot', data, {
@@ -1548,6 +1895,58 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
             projection: { type: state.projection },
           },
           uirevision: 'context-camera-lock',
+          aspectmode: 'data',
+        },
+      }, {responsive: true, displaylogo: false});
+    }
+
+    function renderAllMinimaPlot() {
+      const m = ensureModelDecoded(state.modelName);
+      if (!state.allMinimaCameraLeft) {
+        state.allMinimaCameraLeft = { eye: {x: 1.25, y: 1.0, z: 0.8}, projection: { type: state.projection } };
+      } else {
+        state.allMinimaCameraLeft.projection = { type: state.projection };
+      }
+      if (!state.allMinimaCameraRight) {
+        state.allMinimaCameraRight = { eye: {x: 1.25, y: 1.0, z: 0.8}, projection: { type: state.projection } };
+      } else {
+        state.allMinimaCameraRight.projection = { type: state.projection };
+      }
+
+      const data = [
+        { ...meshTrace(m), scene: 'scene' },
+        { ...edgeTrace(m), scene: 'scene' },
+      ];
+      const cloud = currentAllRmsMinimaCloud();
+      if (state.showYellowSection && cloud.points.length > 0) {
+        data.push({ ...minimaCloudTrace(cloud.points, cloud.text), scene: 'scene2' });
+      }
+
+      Plotly.react('allMinimaPlot', data, {
+        margin: {l: 0, r: 0, b: 0, t: 44},
+        title: `Split view: model | minima cloud (count=${cloud.points.length})`,
+        scene: {
+          domain: { x: [0.0, 0.49], y: [0.0, 1.0] },
+          xaxis: {title: 'X'},
+          yaxis: {title: 'Y'},
+          zaxis: {title: 'Z'},
+          camera: {
+            eye: scaledEye(state.allMinimaCameraLeft.eye, state.zoomAbs),
+            projection: { type: state.projection },
+          },
+          uirevision: 'all-minima-camera-left-lock',
+          aspectmode: 'data',
+        },
+        scene2: {
+          domain: { x: [0.51, 1.0], y: [0.0, 1.0] },
+          xaxis: {title: 'X'},
+          yaxis: {title: 'Y'},
+          zaxis: {title: 'Z'},
+          camera: {
+            eye: scaledEye(state.allMinimaCameraRight.eye, state.zoomAbs),
+            projection: { type: state.projection },
+          },
+          uirevision: 'all-minima-camera-right-lock',
           aspectmode: 'data',
         },
       }, {responsive: true, displaylogo: false});
@@ -1578,27 +1977,92 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
 
     function renderFnPlot() {
       updateZSliderBounds();
-      const y = extractYAtZ(state.zIdx);
-      const x = Array.from({length: y.length}, (_, i) => i);
+      const yDist = extractYAtZ(state.zIdx, 'distances');
+      const yFit = extractYAtZ(state.zIdx, 'fitRms');
+      const x = Array.from({length: yDist.length}, (_, i) => i);
       const zVal = state.computed.zLevels[state.zIdx] ?? NaN;
+      const minima = currentRmsMinimaSelection();
 
       const src = state.computed && state.computed.source ? state.computed.source : 'dynamic';
-      status.textContent = `${src}: z_step=${Number(state.zStep).toFixed(6)}, window=${state.window}, z=${Number(zVal).toFixed(6)}, n_half=${state.computed.nWindows}`;
+      status.textContent = `${src}: z_step=${Number(state.zStep).toFixed(6)}, window=${state.window}, z=${Number(zVal).toFixed(6)}, n_half=${state.computed.nWindows}, minima=${minima.indices.length}, pct=${Number(state.rmsMinPct).toFixed(1)}%`;
 
-      Plotly.react('fnPlot', [{
-        type: 'scatter',
-        mode: 'lines',
-        x, y,
-        line: { color: '#0077b6', width: 2.5 },
-        connectgaps: false,
-      }], {
-        margin: {l: 58, r: 14, b: 48, t: 44},
-        title: `Full-circle distance function | z=${Number(zVal).toFixed(6)}`,
-        xaxis: { title: 'Window transition index i (cyclic)' },
-        yaxis: { title: 'Distance' },
+      const traces = [
+        {
+          type: 'scatter',
+          mode: 'lines',
+          x,
+          y: yDist,
+          name: 'Distance',
+          xaxis: 'x2',
+          yaxis: 'y',
+          line: { color: '#0077b6', width: 2.5 },
+          connectgaps: false,
+        },
+      ];
+      if (state.computed.fitRms) {
+        traces.push({
+          type: 'scatter',
+          mode: 'lines',
+          x,
+          y: yFit,
+          name: 'RMS fit error',
+          xaxis: 'x',
+          yaxis: 'y2',
+          line: { color: '#d62828', width: 2.5 },
+          connectgaps: false,
+        });
+        if (Number.isFinite(minima.threshold) && x.length > 0) {
+          traces.push({
+            type: 'scatter',
+            mode: 'lines',
+            x: [x[0], x[x.length - 1]],
+            y: [minima.threshold, minima.threshold],
+            name: 'RMS minima threshold',
+            xaxis: 'x',
+            yaxis: 'y2',
+            line: { color: '#ff9f1c', width: 1.5, dash: 'dot' },
+            hoverinfo: 'skip',
+          });
+        }
+        if (minima.indices.length > 0) {
+          traces.push({
+            type: 'scatter',
+            mode: 'markers',
+            x: minima.indices,
+            y: minima.values,
+            name: 'Selected local minima',
+            xaxis: 'x',
+            yaxis: 'y2',
+            visible: state.showYellowSection ? true : 'legendonly',
+            showlegend: false,
+            marker: { size: 7, color: '#ffd166', line: { color: '#8a5a00', width: 1.2 } },
+          });
+        } else {
+          traces.push({
+            type: 'scatter',
+            mode: 'markers',
+            x: [],
+            y: [],
+            name: 'Selected local minima',
+            xaxis: 'x',
+            yaxis: 'y2',
+            visible: state.showYellowSection ? true : 'legendonly',
+            showlegend: false,
+            marker: { size: 7, color: '#ffd166', line: { color: '#8a5a00', width: 1.2 } },
+          });
+        }
+      }
+
+      Plotly.react('fnPlot', traces, {
+        margin: {l: 58, r: 14, b: 48, t: 10},
+        xaxis: { title: 'Window transition index i (cyclic)', anchor: 'y2' },
+        xaxis2: { matches: 'x', showticklabels: false, title: '', anchor: 'y' },
+        yaxis: { domain: [0.54, 1.0], title: 'Distance', anchor: 'x2' },
+        yaxis2: { domain: [0.0, 0.46], anchor: 'x', title: 'RMS error' },
+        legend: { orientation: 'h', x: 0.0, y: 1.08 },
       }, {responsive: true, displaylogo: false});
 
-      bindFnPlotMouseTracking(y.length);
+      bindFnPlotMouseTracking(yDist.length);
     }
 
     function recomputeAndRender() {
@@ -1606,6 +2070,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       recomputeDynamic();
       renderFnPlot();
       renderContextPlot();
+      renderAllMinimaPlot();
       renderTopPlot();
     }
 
@@ -1614,6 +2079,8 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       state.contourIdx = 0;
       state.topCamera = null;
       state.contextCamera = null;
+      state.allMinimaCameraLeft = null;
+      state.allMinimaCameraRight = null;
       state.zIdx = 0;
       recomputeAndRender();
     });
@@ -1627,6 +2094,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       state.projection = projMode.value;
       renderTopPlot();
       renderContextPlot();
+      renderAllMinimaPlot();
     });
 
     zoomAbs.addEventListener('input', () => {
@@ -1636,6 +2104,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       zoomAbsLabel2.textContent = `${state.zoomAbs.toFixed(2)}x`;
       renderTopPlot();
       renderContextPlot();
+      renderAllMinimaPlot();
     });
 
     zoomAbs2.addEventListener('input', () => {
@@ -1645,6 +2114,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       zoomAbsLabel2.textContent = `${state.zoomAbs.toFixed(2)}x`;
       renderTopPlot();
       renderContextPlot();
+      renderAllMinimaPlot();
     });
 
     function setContextView(axis) {
@@ -1667,6 +2137,30 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     windowInput.addEventListener('change', () => {
       state.window = Number(windowInput.value);
       recomputeAndRender();
+    });
+
+    rmsMinPctInput.addEventListener('change', () => {
+      state.rmsMinPct = Math.max(0, Math.min(100, Number(rmsMinPctInput.value) || 0));
+      rmsMinPctInput.value = String(state.rmsMinPct);
+      state.rmsMinimaCacheKey = null;
+      state.rmsMinimaCache = null;
+      state.allMinimaCloudCacheKey = null;
+      state.allMinimaCloudCache = null;
+      renderFnPlot();
+      renderContextPlot();
+      renderAllMinimaPlot();
+    });
+
+    showRedSectionChk.addEventListener('change', () => {
+      state.showRedSection = !!showRedSectionChk.checked;
+      renderContextPlot();
+    });
+
+    showYellowSectionChk.addEventListener('change', () => {
+      state.showYellowSection = !!showYellowSectionChk.checked;
+      renderFnPlot();
+      renderContextPlot();
+      renderAllMinimaPlot();
     });
 
     zIdx.addEventListener('input', () => {
@@ -1692,6 +2186,9 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     zoomAbsLabel.textContent = `${state.zoomAbs.toFixed(2)}x`;
     zoomAbs2.value = String(state.zoomAbs.toFixed(2));
     zoomAbsLabel2.textContent = `${state.zoomAbs.toFixed(2)}x`;
+    rmsMinPctInput.value = String(state.rmsMinPct);
+    showRedSectionChk.checked = !!state.showRedSection;
+    showYellowSectionChk.checked = !!state.showYellowSection;
     recomputeAndRender();
   </script>
 </body>
@@ -1824,6 +2321,7 @@ def precompute_windows_cache(
         )
         for window in window_iter:
             line_points = np.full((n_half, n_levels, 3), np.nan, dtype=float)
+            fit_rms = np.full((n_half, n_levels), np.nan, dtype=float)
             for zi in range(n_levels):
                 p_zi = half_points[:, zi, :]  # (N,3)
                 valid = np.all(np.isfinite(p_zi), axis=1) & valid_dn  # (N,)
@@ -1834,11 +2332,14 @@ def precompute_windows_cache(
                 b_i = np.einsum("nij,nj->ni", a_base, p_zi, optimize=True)
                 b_i[~valid, :] = 0.0
                 c_i = valid.astype(np.int32)
+                q_i = np.einsum("ni,ni->n", b_i, b_i, optimize=True)
+                q_i[~valid] = 0.0
 
                 # Cyclic sliding sums via doubled arrays + prefix sums.
                 a_ext = np.concatenate([a_i, a_i], axis=0)  # (2N,3,3)
                 b_ext = np.concatenate([b_i, b_i], axis=0)  # (2N,3)
                 c_ext = np.concatenate([c_i, c_i], axis=0)  # (2N,)
+                q_ext = np.concatenate([q_i, q_i], axis=0)  # (2N,)
 
                 a_pref = np.concatenate(
                     [np.zeros((1, 3, 3), dtype=float), np.cumsum(a_ext, axis=0)],
@@ -1852,12 +2353,17 @@ def precompute_windows_cache(
                     [np.zeros((1,), dtype=np.int32), np.cumsum(c_ext, axis=0)],
                     axis=0,
                 )  # (2N+1,)
+                q_pref = np.concatenate(
+                    [np.zeros((1,), dtype=float), np.cumsum(q_ext, axis=0)],
+                    axis=0,
+                )  # (2N+1,)
 
                 starts = np.arange(n_half, dtype=int)
                 ends = starts + window
                 a_sum = a_pref[ends] - a_pref[starts]  # (N,3,3)
                 b_sum = b_pref[ends] - b_pref[starts]  # (N,3)
                 c_sum = c_pref[ends] - c_pref[starts]  # (N,)
+                q_sum = q_pref[ends] - q_pref[starts]  # (N,)
 
                 valid_ws = c_sum >= 2
                 if not np.any(valid_ws):
@@ -1890,6 +2396,20 @@ def precompute_windows_cache(
                             directions=normals[idx_arr][local_valid],
                         )
 
+                valid_lp = np.all(np.isfinite(line_points[:, zi, :]), axis=1) & valid_ws
+                if np.any(valid_lp):
+                    x = line_points[valid_lp, zi, :]  # (M,3)
+                    a_loc = a_sum[valid_lp]  # (M,3,3)
+                    b_loc = b_sum[valid_lp]  # (M,3)
+                    q_loc = q_sum[valid_lp]  # (M,)
+                    c_loc = c_sum[valid_lp].astype(float)  # (M,)
+                    ax = np.einsum("nij,nj->ni", a_loc, x, optimize=True)  # (M,3)
+                    x_ax = np.einsum("ni,ni->n", x, ax, optimize=True)  # (M,)
+                    b_x = np.einsum("ni,ni->n", b_loc, x, optimize=True)  # (M,)
+                    sse = x_ax - 2.0 * b_x + q_loc
+                    sse = np.maximum(sse, 0.0)
+                    fit_rms[valid_lp, zi] = np.sqrt(sse / np.maximum(c_loc, 1.0))
+
             distances = np.full((n_half, n_levels), np.nan, dtype=float)
             for i in range(n_half):
                 nxt = (i + 1) % n_half
@@ -1902,6 +2422,7 @@ def precompute_windows_cache(
                 "z_step": float(z_step),
                 "z_levels": encode_array(z_levels, "<f4"),
                 "distances": encode_array(distances, "<f4"),
+                "fit_rms": encode_array(fit_rms, "<f4"),
             }
 
         out_models[model_name] = {
