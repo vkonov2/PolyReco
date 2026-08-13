@@ -221,15 +221,21 @@ uv run python src/generate_full_circle_split_cached_viewer.py --models round --m
 - по representative-точкам left/right low-регионов фитятся плоскости кандидатов;
 - hull кандидата рисуется строго в fitted-плоскости, а не исходными шумными точками;
 - кандидаты сортируются по `candidate_score = plane_rms / sqrt(levels)`, затем по `hull_diameter`;
+- ориентация полупространств задается через `--orientation-mode`:
+  - `observed-points` - дефолтный режим, ориентирует нормали по большинству наблюдаемых `line_points`;
+  - `model-vertices` - диагностический режим, ориентирует нормали по вершинам `InitialModel`;
+  - `inside-point` - старый режим через одну среднюю внутреннюю точку;
+- для `--orientation-mode model-vertices` есть диагностический support-фильтр `--model-support-max-outside-count`, который удаляет плоскости, если после ориентации они оставляют слишком много вершин `InitialModel` снаружи;
 - reference-фильтр по `InitialModel`, merge похожих плоскостей и hull-фильтры сейчас убраны из основной логики;
-- `InitialModel` используется в HTML только для сравнения, а не для принятия кандидатов;
+- `InitialModel` в основном режиме используется в HTML только для сравнения, но в диагностическом `model-vertices` режиме может использоваться для ориентации нормалей и support-фильтра;
 - модель строится как пересечение полупространств выбранных плоскостей: внутри считается сторона `normal · (x - point) <= tol`;
 - после первого пересечения выполняется post-filter активных граней: если грань пересечения от кандидата сильно больше локального observed hull, кандидат удаляется и пересечение пересчитывается;
 - HTML viewer показывает:
-  - сверху одно большое окно `Найденные плоскости + активные грани пересечения`;
-  - снизу три окна: `Исходная модель`, `Полученная модель`, `Наложение`;
+  - сетку 2x2: `Найденные плоскости + активные грани пересечения`, `Наложение`, `Исходная модель`, `Полученная модель`;
+  - отдельные галочки `Найденные плоскости` и `Активные грани` для верхнего левого окна;
   - в `Наложение` нет найденных плоскостей-кандидатов, только исходная и восстановленная модели;
-  - нижние три окна должны синхронизировать камеру через `plotly_relayout`.
+  - в `Наложение` исходная модель усилена opacity и черным wireframe;
+  - все четыре окна должны синхронизировать камеру через `plotly_relayout`.
 
 Основная команда для текущего эксперимента:
 
@@ -248,6 +254,9 @@ uv run python src/reconstruct_faces_from_rms_regions.py --model round --no-progr
 --max-low-distance 35.0
 --low-region-samples 3
 --max-plane-rms 0.08
+--orientation-mode observed-points
+--model-support-tol 0.03
+--model-support-max-outside-count -1
 --max-candidates 180
 --max-active-face-hull-area-ratio 20.0
 --max-active-face-extra-area 1.0
@@ -274,6 +283,25 @@ intersection: 442 vertices / 100 faces
 - `output/round_rms_face_regions.html`;
 - `output/round_rms_face_regions.json`.
 
+Отдельный диагностический viewer для fixed `window=10`:
+
+```bash
+uv run python src/reconstruct_faces_from_rms_regions.py --model round --windows 10 --window 10 --no-progress --peak-threshold 0.00395 --low-threshold 0.00038 --orientation-mode model-vertices --model-support-max-outside-count 20 --max-active-face-hull-area-ratio -1 --max-active-face-extra-area -1 --output-html output/round_rms_face_regions_window10.html --output-json output/round_rms_face_regions_window10.json
+```
+
+Последний результат fixed `window=10`:
+
+```text
+peak_observations: 5477
+tracks: 298
+used planes after model support filter: 123
+intersection: 417 vertices / 105 faces
+orientation_mode: model-vertices
+model_support_max_outside_count: 20
+```
+
+Важно: `window=10` плоскости визуально выглядят адекватно, но пересечение без диагностической ориентации/support-фильтра схлопывалось. С `--orientation-mode observed-points` было `41 vertices / 22 faces`, с `--orientation-mode model-vertices` без support-фильтра было `275 vertices / 99 faces`, с support-фильтром `20` стало `417 vertices / 105 faces`.
+
 Что уже проверялось:
 
 - `uv run python -m compileall src/reconstruct_faces_from_rms_regions.py`;
@@ -281,6 +309,7 @@ intersection: 442 vertices / 100 faces
 - проверено, что четыре Plotly-панели рендерятся;
 - проверено, что HTML содержит `plotPlanes`, `plotInitial`, `plotReconstructed`, `plotOverlay`;
 - проверено, что overlay строится без `candidateTraces(limit)`;
+- проверено, что HTML содержит `showPlanesInput` и `showActiveFacesInput`;
 - на момент последней проверки статус viewer: `planes=100/100, intersection=442v/100f`.
 - поле `Показать плоскостей` теперь по умолчанию равно числу выбранных кандидатов.
 
@@ -293,6 +322,7 @@ intersection: 442 vertices / 100 faces
 - Добавлен post-filter `active_face_size`: он удалил 80 кандидатов, у которых активная грань пересечения была несоразмерно больше observed hull.
 - Без reference-фильтра и merge похожих плоскостей результат стал более честным, но менее полным: сейчас `100` граней пересечения против `256` исходных.
 - Простое добавление большего числа кандидатов после `180` снова ухудшает пересечение: при `220+` плоскостях часть несовместимых кандидатов схлопывает модель.
+- Для fixed `window=10` основная проблема пересечения была в плоскостях, проходящих через объем: визуальный observed hull выглядел правильно, но бесконечное полупространство отрезало часть модели. Диагностический support-фильтр по `InitialModel` это подтверждает.
 - Следующее улучшение должно повышать совместимость набора плоскостей без обращения к `InitialModel`.
 
 Как улучшать дальше:
@@ -308,13 +338,9 @@ intersection: 442 vertices / 100 faces
    - должна иметь малый plane RMS;
    - должна не создавать чрезмерно большие грани, проходящие поперек модели.
 6. Сделать итеративное пересечение: добавлять плоскости по одной и отклонять те, которые резко уменьшают объем/число активных граней или дают неадекватные сечения.
-7. Для диагностики добавить в HTML включение/выключение:
-   - исходной модели;
-   - восстановленной модели;
-   - конкретных окон `window`;
-   - конкретных зон `z`;
-   - плоскостей с большим `plane_rms`, `candidate_score`, `hull_diameter` или `low_distance_max`.
-8. Для финального сравнения добавить метрики между восстановленной и исходной моделью:
+7. Заменить диагностический support-фильтр по `InitialModel` внутренним критерием: плоскость не должна резко противоречить наблюдаемым сечениям/контурам и не должна проходить через объем.
+8. Для диагностики добавить в HTML фильтры по конкретным окнам `window`, зонам `z`, `plane_rms`, `candidate_score`, `hull_diameter`, `low_distance_max`, `support_outside_count`.
+9. Для финального сравнения добавить метрики между восстановленной и исходной моделью:
    - распределение расстояний вершин восстановленной модели до поверхности `InitialModel`;
    - распределение расстояний вершин `InitialModel` до восстановленной поверхности;
    - объем/габариты;

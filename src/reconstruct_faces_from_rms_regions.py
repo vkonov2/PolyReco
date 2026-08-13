@@ -436,6 +436,33 @@ def orient_plane_from_inside_point(
     return normal
 
 
+def orient_plane_from_observed_points(
+    plane: PlaneFit,
+    observed_points: np.ndarray,
+    inside_point: np.ndarray,
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    normal = plane.normal.copy()
+    pts = np.asarray(observed_points, dtype=float).reshape((-1, 3))
+    pts = pts[np.all(np.isfinite(pts), axis=1)]
+    if pts.shape[0] < 3:
+        return orient_plane_from_inside_point(plane, inside_point), {
+            "orientation_positive_frac": float("nan"),
+            "orientation_point_count": 0,
+        }
+
+    signed = (pts - plane.centroid) @ normal
+    positive = int(np.sum(signed > 0.0))
+    negative = int(np.sum(signed < 0.0))
+    if positive > negative:
+        normal *= -1.0
+        positive = negative
+
+    return normal, {
+        "orientation_positive_frac": float(positive / max(1, int(pts.shape[0]))),
+        "orientation_point_count": int(pts.shape[0]),
+    }
+
+
 def plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     n = normal / max(float(np.linalg.norm(normal)), EPS)
     ref = np.array([0.0, 0.0, 1.0], dtype=float)
@@ -558,6 +585,10 @@ def build_face_candidates(
     min_fit_points: int,
     max_plane_rms: float,
     inside_point: np.ndarray,
+    orientation_points: np.ndarray,
+    support_points: np.ndarray,
+    support_tol: float,
+    max_support_outside_count: int,
     low_region_samples: int,
     bounds_min: np.ndarray,
     bounds_max: np.ndarray,
@@ -580,7 +611,19 @@ def build_face_candidates(
         plane = fit_plane(fit_pts)
         if plane is None or plane.rms > max_plane_rms:
             continue
-        support_normal = orient_plane_from_inside_point(plane, inside_point)
+        support_normal, orientation = orient_plane_from_observed_points(
+            plane,
+            orientation_points,
+            inside_point,
+        )
+        support_outside_count = 0
+        support_positive_max = float("nan")
+        if support_points.size:
+            signed_support = (support_points - plane.centroid) @ support_normal
+            support_outside_count = int(np.sum(signed_support > float(support_tol)))
+            support_positive_max = float(np.max(signed_support))
+            if max_support_outside_count >= 0 and support_outside_count > int(max_support_outside_count):
+                continue
 
         u, v = plane_basis(support_normal)
         rel = fit_pts - plane.centroid
@@ -631,6 +674,10 @@ def build_face_candidates(
                 "plane_normal": as_json_point(support_normal),
                 "plane_rms": as_json_float(plane.rms),
                 "plane_max_abs": as_json_float(plane.max_abs),
+                "orientation_positive_frac": as_json_float(float(orientation["orientation_positive_frac"])),
+                "orientation_point_count": int(orientation["orientation_point_count"]),
+                "support_outside_count": int(support_outside_count),
+                "support_positive_max": as_json_float(support_positive_max),
                 "candidate_score": as_json_float(candidate_score),
                 "hull_diameter": as_json_float(hull_diameter),
                 "hull_area": as_json_float(hull_area),
@@ -1190,6 +1237,18 @@ def main() -> None:
     parser.add_argument("--min-fit-points", type=int, default=18)
     parser.add_argument("--low-region-samples", type=int, default=3)
     parser.add_argument("--max-plane-rms", type=float, default=0.08)
+    parser.add_argument(
+        "--orientation-mode",
+        choices=("observed-points", "model-vertices", "inside-point"),
+        default="observed-points",
+    )
+    parser.add_argument("--model-support-tol", type=float, default=0.03)
+    parser.add_argument(
+        "--model-support-max-outside-count",
+        type=int,
+        default=-1,
+        help="Diagnostic filter for orientation-mode=model-vertices. Negative disables.",
+    )
     parser.add_argument("--max-candidates", type=int, default=180)
     parser.add_argument("--max-active-face-hull-area-ratio", type=float, default=20.0)
     parser.add_argument("--max-active-face-extra-area", type=float, default=1.0)
@@ -1288,6 +1347,16 @@ def main() -> None:
     )
     finite_points = line_points[finite_mask]
     inside_point = np.mean(finite_points, axis=0) if finite_points.size else np.mean(vertices, axis=0)
+    if args.orientation_mode == "model-vertices":
+        orientation_points = vertices
+        support_points = vertices
+    elif args.orientation_mode == "inside-point":
+        orientation_points = np.zeros((0, 3), dtype=float)
+        support_points = np.zeros((0, 3), dtype=float)
+    else:
+        orientation_step = max(1, int(finite_points.shape[0]) // 25000) if finite_points.size else 1
+        orientation_points = finite_points[::orientation_step] if finite_points.size else finite_points
+        support_points = np.zeros((0, 3), dtype=float)
     all_candidates = build_face_candidates(
         tracks,
         line_points,
@@ -1296,6 +1365,10 @@ def main() -> None:
         min_fit_points=int(args.min_fit_points),
         max_plane_rms=float(args.max_plane_rms),
         inside_point=inside_point,
+        orientation_points=orientation_points,
+        support_points=support_points,
+        support_tol=float(args.model_support_tol),
+        max_support_outside_count=int(args.model_support_max_outside_count),
         low_region_samples=int(args.low_region_samples),
         bounds_min=point_bounds_min,
         bounds_max=point_bounds_max,
@@ -1339,6 +1412,9 @@ def main() -> None:
         "min_fit_points": int(args.min_fit_points),
         "low_region_samples": int(args.low_region_samples),
         "max_plane_rms": float(args.max_plane_rms),
+        "orientation_mode": str(args.orientation_mode),
+        "model_support_tol": float(args.model_support_tol),
+        "model_support_max_outside_count": int(args.model_support_max_outside_count),
         "max_candidates": int(args.max_candidates),
         "post_filter_candidates": int(len(candidates)),
         "max_active_face_hull_area_ratio": float(args.max_active_face_hull_area_ratio),
@@ -1348,6 +1424,7 @@ def main() -> None:
         "raw_candidates_before_merge": int(len(all_candidates)),
         "candidates_after_merge": None,
         "inside_point": as_json_point(inside_point),
+        "orientation_point_count": int(orientation_points.shape[0]),
         "intersection_inside_tol": float(args.intersection_inside_tol),
         "intersection_vertex_tol": float(args.intersection_vertex_tol),
     }
