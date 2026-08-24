@@ -58,6 +58,7 @@ REQUIRED_RUNTIME_SYMBOLS: tuple[str, ...] = (
     "candidate_z_intervals",
     "interval_overlap",
     "distribution_summary",
+    "diagnose_generic_cross_view_edge_pool",
     "candidate_z_range",
     "hull_bounds_overlap_ratio",
     "candidates_plane_patch_compatible",
@@ -325,6 +326,143 @@ def dispatch_post_multiscale_oracle_scope(
                 trials=int(trials.get("trial_count") or 0),
                 safe=int(trials.get("safe_count") or 0),
                 output=pruning_output,
+            )
+        )
+        return True
+    return False
+
+
+def dispatch_post_w2_oracle_scope(
+    *,
+    scope: str,
+    environment: Mapping[str, str],
+    args: object,
+    model_name: str,
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    contours: list[object],
+    z_levels: np.ndarray,
+    w2_line_points: np.ndarray,
+    w2_segments: list[dict[str, object]],
+    w2_clusters: list[dict[str, object]],
+    w2_candidates: list[dict[str, object]],
+    trusted_points: np.ndarray,
+    trusted_z_indices: np.ndarray,
+) -> bool:
+    if scope == "current-candidate-exchange":
+        baseline_json_path = environment.get("POLYRECO_CURRENT_CANDIDATE_EXCHANGE_BASELINE_JSON")
+        if not baseline_json_path:
+            raise RuntimeError(
+                "POLYRECO_ORACLE_DIAGNOSTIC_SCOPE=current-candidate-exchange requires "
+                "POLYRECO_CURRENT_CANDIDATE_EXCHANGE_BASELINE_JSON for the bounded fast path"
+            )
+        try:
+            baseline_payload = json.loads(Path(baseline_json_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"failed to read current-candidate exchange baseline JSON {baseline_json_path!r}: {exc!r}"
+            ) from exc
+        baseline_candidates = [
+            candidate for candidate in baseline_payload.get("face_candidates", [])
+            if isinstance(candidate, dict)
+        ]
+        baseline_reconstructed = baseline_payload.get("reconstructed")
+        if not baseline_candidates or not isinstance(baseline_reconstructed, dict):
+            raise RuntimeError(
+                "current-candidate exchange baseline JSON must contain face_candidates and reconstructed"
+            )
+        target_face_ids_by_model = {
+            "pear": [107, 113, 118, 120, 122, 125, 130, 150, 196, 214],
+            "cushion": [0, 3, 20, 119, 218, 256, 285],
+        }
+        exchange_output = Path(
+            environment.get(
+                "POLYRECO_CURRENT_CANDIDATE_EXCHANGE_OUTPUT_JSON",
+                f"/private/tmp/{model_name}_current_candidate_exchange.json",
+            )
+        )
+        diagnostic_payload = diagnose_current_candidate_exchange(
+            model_name=model_name,
+            vertices=vertices,
+            model_faces=model_face_planes(vertices, faces),
+            final_candidates=baseline_candidates,
+            final_reconstructed=baseline_reconstructed,
+            trusted_points=trusted_points,
+            trusted_z_indices=trusted_z_indices,
+            point_tol=float(args.compatibility_point_tol),
+            reconstruction_kwargs={
+                "halfspace_slack": float(args.intersection_halfspace_slack),
+                "feasibility_tol": float(args.intersection_feasibility_tol),
+                "incidence_tol": float(args.intersection_incidence_tol),
+                "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
+                "min_face_area": float(args.intersection_min_face_area),
+                "triple_det_tol": float(args.intersection_triple_det_tol),
+                "prune_redundant": bool(args.intersection_prune_redundant_planes),
+                "redundancy_tol": float(args.intersection_redundancy_tol),
+            },
+            contours=contours,
+            target_face_ids=target_face_ids_by_model.get(str(model_name), []),
+            baseline_payload=baseline_payload,
+            max_full_trials=30,
+        )
+        diagnostic_payload["diagnostic_output_path"] = str(exchange_output)
+        diagnostic_payload["baseline_json_path"] = baseline_json_path
+        diagnostic_payload["fast_path"] = "baseline_final_state_plus_in_process_trusted_cloud"
+        exchange_output.parent.mkdir(parents=True, exist_ok=True)
+        exchange_output.write_text(
+            json.dumps(diagnostic_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            "current-candidate-exchange model={model} targets={targets} trials={trials} output={output}".format(
+                model=model_name,
+                targets=len(target_face_ids_by_model.get(str(model_name), [])),
+                trials=int((diagnostic_payload.get("full_edge_clip_trials") or {}).get("trial_count") or 0),
+                output=exchange_output,
+            )
+        )
+        return True
+    if scope in {"generic-cross-view-edge-pool", "generic-edge-additive-control"}:
+        additive_scope = scope == "generic-edge-additive-control"
+        diagnostic_output = Path(
+            environment.get(
+                "POLYRECO_GENERIC_EDGE_OUTPUT_JSON",
+                f"/private/tmp/{model_name}_{'generic_edge_additive' if additive_scope else 'generic_cross_view_edges'}.json",
+            )
+        )
+        baseline_payload = None
+        baseline_json_path = environment.get("POLYRECO_GENERIC_EDGE_BASELINE_JSON")
+        if baseline_json_path:
+            try:
+                baseline_payload = json.loads(Path(baseline_json_path).read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                baseline_payload = {"_load_error": repr(exc), "_path": str(baseline_json_path)}
+        diagnostic_payload = diagnose_generic_cross_view_edge_pool(
+            model_name=model_name,
+            vertices=vertices,
+            faces=faces,
+            z_levels=z_levels,
+            line_points_w2=w2_line_points,
+            w2_segments=w2_segments,
+            w2_clusters=w2_clusters,
+            w2_candidates=w2_candidates,
+            baseline_payload=baseline_payload,
+            additive_mode=additive_scope,
+        )
+        diagnostic_payload["diagnostic_output_path"] = str(diagnostic_output)
+        diagnostic_payload["baseline_json_path"] = baseline_json_path
+        diagnostic_output.parent.mkdir(parents=True, exist_ok=True)
+        diagnostic_output.write_text(
+            json.dumps(diagnostic_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            "{scope} model={model} primitives={primitives} hypotheses={hypotheses} output={output}".format(
+                scope=scope,
+                model=model_name,
+                primitives=int((diagnostic_payload.get("primitive_pool") or {}).get("materialized_primitives") or 0),
+                hypotheses=int((diagnostic_payload.get("consensus") or {}).get("kept_hypotheses") or 0),
+                output=diagnostic_output,
             )
         )
         return True
