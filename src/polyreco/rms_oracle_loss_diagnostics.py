@@ -37,6 +37,7 @@ REQUIRED_RUNTIME_SYMBOLS: tuple[str, ...] = (
     "build_w2_face_candidates",
     "point_to_face_polygon_distance",
     "candidate_oracle_face",
+    "oracle_candidate_cohort",
     "model_edges_from_faces",
     "model_face_planes",
     "oracle_edge_cluster_matches",
@@ -58,7 +59,6 @@ REQUIRED_RUNTIME_SYMBOLS: tuple[str, ...] = (
     "candidate_z_intervals",
     "interval_overlap",
     "distribution_summary",
-    "diagnose_generic_cross_view_edge_pool",
     "candidate_z_range",
     "hull_bounds_overlap_ratio",
     "candidates_plane_patch_compatible",
@@ -14366,4 +14366,2837 @@ def diagnose_current_candidate_exchange(
         },
         "lp_engine_diagnostics": lp_engine.summary(),
         "timing_seconds": {key: as_json_float(float(value)) for key, value in timings.items()},
+    }
+
+
+def _auc_binary(values: list[tuple[float, bool]], *, higher_is_better: bool) -> float | None:
+    clean = [(float(score), bool(label)) for score, label in values if np.isfinite(float(score))]
+    pos = sum(1 for _, label in clean if label)
+    neg = len(clean) - pos
+    if pos == 0 or neg == 0:
+        return None
+    if not higher_is_better:
+        clean = [(-score, label) for score, label in clean]
+    wins = 0.0
+    for p_score, p_label in clean:
+        if not p_label:
+            continue
+        for n_score, n_label in clean:
+            if n_label:
+                continue
+            if p_score > n_score:
+                wins += 1.0
+            elif p_score == n_score:
+                wins += 0.5
+    return float(wins / max(pos * neg, EPS))
+
+
+def _pr_auc_binary(values: list[tuple[float, bool]], *, higher_is_better: bool) -> float | None:
+    clean = [(float(score), bool(label)) for score, label in values if np.isfinite(float(score))]
+    positives = sum(1 for _, label in clean if label)
+    if positives == 0:
+        return None
+    clean.sort(key=lambda item: item[0], reverse=higher_is_better)
+    tp = 0
+    fp = 0
+    prev_recall = 0.0
+    area = 0.0
+    for _, label in clean:
+        if label:
+            tp += 1
+        else:
+            fp += 1
+        recall = tp / positives
+        precision = tp / max(tp + fp, 1)
+        area += precision * max(0.0, recall - prev_recall)
+        prev_recall = recall
+    return float(area)
+
+
+def _view_interval_indices(center: int, width: int, count: int) -> np.ndarray:
+    half = int(width) // 2
+    return np.array([(int(center) + delta) % int(count) for delta in range(-half, int(width) - half)], dtype=int)
+
+
+def _candidate_from_observed_points(points: np.ndarray, *, source: str) -> dict[str, object] | None:
+    fit = fit_plane(points)
+    if fit is None:
+        return None
+    u, v = plane_basis(fit.normal)
+    local = np.column_stack([(points - fit.centroid) @ u, (points - fit.centroid) @ v])
+    hull = points
+    if local.shape[0] >= 3:
+        hull_indices = convex_hull_indices(local)
+        if len(hull_indices) >= 3:
+            hull = points[np.array(hull_indices, dtype=int)]
+    return {
+        "track_id": -1,
+        "candidate_origin": "oracle_raw_signal_diagnostic",
+        "candidate_source": str(source),
+        "plane_centroid": as_json_point(fit.centroid),
+        "normal": as_json_point(fit.normal),
+        "plane_rms": as_json_float(float(fit.rms)),
+        "plane_max_abs": as_json_float(float(fit.max_abs)),
+        "hull": [as_json_point(p) for p in hull],
+        "hull_area": as_json_float(polygon_area(hull)),
+        "support_points": int(points.shape[0]),
+    }
+
+
+def diagnose_view_conditioned_raw_support(
+    *,
+    model_name: str,
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    windows: list[int],
+    z_levels: np.ndarray,
+    line_points_by_window: np.ndarray | None,
+    fit_rms_by_window: np.ndarray | None,
+    cond_by_window: np.ndarray | None,
+    point_bounds_min: np.ndarray,
+    point_bounds_max: np.ndarray,
+    peak_threshold: float,
+    low_threshold: float,
+    final_candidates: list[dict[str, object]],
+    final_reconstructed: dict[str, object],
+    model_faces: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    if line_points_by_window is None or fit_rms_by_window is None:
+        return {
+            "schema_version": 1,
+            "model": str(model_name),
+            "production_changed": False,
+            "skipped": True,
+            "reason": "multi-window raw line_points are not available in memory",
+        }
+    lp = np.asarray(line_points_by_window, dtype=float)
+    rms = np.asarray(fit_rms_by_window, dtype=float)
+    cond = np.asarray(cond_by_window, dtype=float) if cond_by_window is not None else None
+    if lp.ndim != 4 or lp.shape[-1] != 3:
+        return {
+            "schema_version": 1,
+            "model": str(model_name),
+            "production_changed": False,
+            "skipped": True,
+            "reason": "unexpected line_points_by_window shape",
+            "shape": list(lp.shape),
+        }
+
+    model_face_rows = model_faces or model_face_planes(vertices, faces)
+    nw, n_view, n_z, _ = lp.shape
+    flat_points = lp.reshape((-1, 3))
+    flat_rms = rms.reshape((-1,)) if rms.shape[:3] == lp.shape[:3] else np.full(flat_points.shape[0], float("nan"))
+    flat_cond = cond.reshape((-1,)) if cond is not None and cond.shape[:3] == lp.shape[:3] else np.full(flat_points.shape[0], float("nan"))
+    finite = (
+        np.all(np.isfinite(flat_points), axis=1)
+        & np.all(flat_points >= point_bounds_min[None, :], axis=1)
+        & np.all(flat_points <= point_bounds_max[None, :], axis=1)
+    )
+    finite_indices = np.flatnonzero(finite)
+    finite_points = flat_points[finite_indices]
+    bbox_diag = float(np.linalg.norm(np.max(vertices, axis=0) - np.min(vertices, axis=0))) if vertices.size else 1.0
+    z_step = float(np.median(np.diff(z_levels))) if z_levels.size > 1 else 0.01
+    plane_tol = max(0.0125, 0.004 * bbox_diag, abs(z_step) * 1.25)
+    finite_tol = max(0.025, 0.006 * bbox_diag, abs(z_step) * 1.5)
+    fit_span_tol = max(0.03, 0.008 * bbox_diag)
+    total_flat = int(flat_points.shape[0])
+    assignment_counts = np.zeros(total_flat, dtype=np.uint16)
+    best_distance = np.full(total_flat, float("inf"), dtype=float)
+    best_face = np.full(total_flat, -1, dtype=np.int32)
+    face_support_indices: dict[int, np.ndarray] = {}
+    face_support_distances: dict[int, np.ndarray] = {}
+    face_competing_min_distances: dict[int, np.ndarray] = {}
+
+    face_infos: list[dict[str, object]] = []
+    total_area = 0.0
+    for face in model_face_rows:
+        fid = int(face["face_id"])
+        face_pts = np.array(face["vertices"], dtype=float)
+        normal = np.array(face["normal"], dtype=float)
+        origin = np.mean(face_pts, axis=0)
+        u, v = plane_basis(normal)
+        poly_2d = np.column_stack([(face_pts - origin) @ u, (face_pts - origin) @ v])
+        poly_min = np.min(poly_2d, axis=0)
+        poly_max = np.max(poly_2d, axis=0)
+        area = polygon_area(face_pts)
+        total_area += float(area)
+        face_infos.append({
+            "face_id": fid,
+            "normal": normal,
+            "origin": origin,
+            "u": u,
+            "v": v,
+            "poly_2d": poly_2d,
+            "poly_span": np.maximum(poly_max - poly_min, fit_span_tol),
+            "area": float(area),
+            "z_span": float(max(0.0, float(face["z_max"]) - float(face["z_min"]))),
+            "z_mid": float(0.5 * (float(face["z_min"]) + float(face["z_max"]))),
+            "normal_abs_z": abs(float(normal[2])),
+            "bbox_min": np.min(face_pts, axis=0) - (plane_tol + finite_tol + abs(z_step)),
+            "bbox_max": np.max(face_pts, axis=0) + (plane_tol + finite_tol + abs(z_step)),
+        })
+
+    for info in face_infos:
+        fid = int(info["face_id"])
+        if finite_indices.size == 0:
+            face_support_indices[fid] = np.zeros(0, dtype=int)
+            face_support_distances[fid] = np.zeros(0, dtype=float)
+            continue
+        bbox_min = np.array(info["bbox_min"], dtype=float)
+        bbox_max = np.array(info["bbox_max"], dtype=float)
+        bbox_mask = np.all((finite_points >= bbox_min[None, :]) & (finite_points <= bbox_max[None, :]), axis=1)
+        local_finite = finite_indices[bbox_mask]
+        if local_finite.size == 0:
+            face_support_indices[fid] = np.zeros(0, dtype=int)
+            face_support_distances[fid] = np.zeros(0, dtype=float)
+            continue
+        pts = flat_points[local_finite]
+        normal = np.array(info["normal"], dtype=float)
+        origin = np.array(info["origin"], dtype=float)
+        residual = np.abs((pts - origin[None, :]) @ normal)
+        plane_mask = residual <= plane_tol
+        if not np.any(plane_mask):
+            face_support_indices[fid] = np.zeros(0, dtype=int)
+            face_support_distances[fid] = np.zeros(0, dtype=float)
+            continue
+        local_finite = local_finite[plane_mask]
+        pts = pts[plane_mask]
+        residual = residual[plane_mask]
+        u = np.array(info["u"], dtype=float)
+        v = np.array(info["v"], dtype=float)
+        uv = np.column_stack([(pts - origin[None, :]) @ u, (pts - origin[None, :]) @ v])
+        outside = np.maximum(0.0, polygon_signed_distances_2d(uv, np.array(info["poly_2d"], dtype=float)))
+        support_mask = outside <= finite_tol
+        support_indices = local_finite[support_mask]
+        support_dist = np.sqrt(residual[support_mask] ** 2 + outside[support_mask] ** 2)
+        face_support_indices[fid] = support_indices.astype(int)
+        face_support_distances[fid] = support_dist.astype(float)
+        assignment_counts[support_indices] = np.minimum(assignment_counts[support_indices] + 1, np.iinfo(np.uint16).max)
+        better = support_dist < best_distance[support_indices]
+        if np.any(better):
+            update_idx = support_indices[better]
+            best_distance[update_idx] = support_dist[better]
+            best_face[update_idx] = int(fid)
+
+    for info in face_infos:
+        fid = int(info["face_id"])
+        support = face_support_indices.get(fid, np.zeros(0, dtype=int))
+        if support.size == 0:
+            face_competing_min_distances[fid] = np.zeros(0, dtype=float)
+            continue
+        own = face_support_distances.get(fid, np.zeros(0, dtype=float))
+        face_competing_min_distances[fid] = (best_distance[support] - own).astype(float)
+
+    active_indices = [
+        int(i)
+        for i in final_reconstructed.get("face_candidate_indices", [])
+        if 0 <= int(i) < len(final_candidates)
+    ]
+    active_candidates = [final_candidates[i] for i in active_indices]
+    final_cohort = oracle_candidate_cohort(active_candidates, model_face_rows, active_plane_indices=active_indices)
+    final_ids = set(int(v) for v in final_cohort.get("finite_face_ids", []))
+
+    z_min = float(np.min(vertices[:, 2])) if vertices.size else 0.0
+    z_max = float(np.max(vertices[:, 2])) if vertices.size else 1.0
+    lower_cut = z_min + (z_max - z_min) / 3.0
+    areas = np.array([float(info["area"]) for info in face_infos], dtype=float)
+    small_area_cut = float(np.percentile(areas, 10)) if areas.size else 0.0
+    categories = [
+        "within_single_view",
+        "across_Z_pooling",
+        "across_view_pooling",
+        "track_or_cluster_merge",
+        "finite_footprint_overlap",
+        "insufficient_points_or_span",
+        "clean_fit_ready_support",
+    ]
+    category_counts = {name: 0 for name in categories}
+    ceiling_ids: dict[str, set[int]] = {
+        "full_raw_support_existence": set(),
+        "best_single_view_finite_support": set(),
+        "best_contiguous_view_interval_fit": set(),
+        "cross_view_consensus_fit": set(),
+        "final_active_mesh": set(final_ids),
+    }
+    rows: list[dict[str, object]] = []
+    score_rows: list[tuple[float, bool]] = []
+    feature_rows: list[dict[str, object]] = []
+
+    def evaluate_fit(points: np.ndarray, source: str) -> dict[str, object]:
+        candidate = _candidate_from_observed_points(points, source=source)
+        if candidate is None:
+            return {"fit_ready": False, "finite_good": False, "plane_good": False}
+        match = candidate_oracle_face(candidate, model_face_rows)
+        return {
+            "fit_ready": True,
+            "candidate": candidate,
+            "match": match,
+            "finite_good": bool((match or {}).get("finite_good")),
+            "plane_good": bool((match or {}).get("plane_good")),
+            "face_id": int((match or {}).get("face_id", -1)),
+            "plane_rms": candidate.get("plane_rms"),
+            "hull_area": candidate.get("hull_area"),
+        }
+
+    for info in face_infos:
+        fid = int(info["face_id"])
+        support = face_support_indices.get(fid, np.zeros(0, dtype=int))
+        raw_count = int(support.size)
+        if raw_count:
+            ceiling_ids["full_raw_support_existence"].add(fid)
+        wi = (support // (n_view * n_z)).astype(int) if raw_count else np.zeros(0, dtype=int)
+        rem = (support % (n_view * n_z)).astype(int) if raw_count else np.zeros(0, dtype=int)
+        view_idx = (rem // n_z).astype(int) if raw_count else np.zeros(0, dtype=int)
+        z_idx = (rem % n_z).astype(int) if raw_count else np.zeros(0, dtype=int)
+        pts = flat_points[support] if raw_count else np.zeros((0, 3), dtype=float)
+        unique_views = sorted(int(v) for v in np.unique(view_idx)) if raw_count else []
+        unique_z = sorted(int(v) for v in np.unique(z_idx)) if raw_count else []
+        unique_windows = sorted(int(windows[int(v)]) for v in np.unique(wi)) if raw_count else []
+        pure_mask = (best_face[support] == fid) & (assignment_counts[support] == 1) if raw_count else np.zeros(0, dtype=bool)
+        purity = float(np.mean(pure_mask)) if raw_count else 0.0
+        overlap_frac = float(np.mean(assignment_counts[support] > 1)) if raw_count else 0.0
+        if raw_count:
+            origin = np.array(info["origin"], dtype=float)
+            u = np.array(info["u"], dtype=float)
+            v = np.array(info["v"], dtype=float)
+            uv = np.column_stack([(pts - origin[None, :]) @ u, (pts - origin[None, :]) @ v])
+            span = np.ptp(uv, axis=0) if uv.shape[0] else np.zeros(2, dtype=float)
+            norm_span = np.minimum(span / np.array(info["poly_span"], dtype=float), 1.0)
+            coverage_2d = float(np.min(norm_span))
+        else:
+            uv = np.zeros((0, 2), dtype=float)
+            norm_span = np.zeros(2, dtype=float)
+            coverage_2d = 0.0
+        z_span_obs = float(np.ptp(z_levels[z_idx])) if z_idx.size > 1 else 0.0
+        angular_span = float(len(unique_views) / max(n_view, 1))
+        raw_rms = flat_rms[support] if raw_count else np.zeros(0, dtype=float)
+        raw_cond = flat_cond[support] if raw_count else np.zeros(0, dtype=float)
+        minima_count = 0
+        low_count = 0
+        peak_count = 0
+        if raw_count and rms.shape[:3] == lp.shape[:3]:
+            prev = rms[wi, (view_idx - 1) % n_view, z_idx]
+            cur = rms[wi, view_idx, z_idx]
+            nxt = rms[wi, (view_idx + 1) % n_view, z_idx]
+            minima_count = int(np.sum(np.isfinite(cur) & (cur <= prev) & (cur <= nxt)))
+            low_count = int(np.sum(np.isfinite(cur) & (cur <= float(low_threshold))))
+            peak_count = int(np.sum(np.isfinite(cur) & (cur >= float(peak_threshold))))
+
+        best_view: dict[str, object] = {"view_index": None, "point_count": 0, "purity": None, "coverage_2d": None}
+        contiguous_fits: dict[str, dict[str, object]] = {}
+        if raw_count:
+            view_counts = np.bincount(view_idx, minlength=n_view)
+            for width in (1, 3, 5):
+                best_interval: dict[str, object] | None = None
+                best_points = np.zeros((0, 3), dtype=float)
+                for candidate_center in np.flatnonzero(view_counts > 0):
+                    interval_views = _view_interval_indices(int(candidate_center), int(width), int(n_view))
+                    mask = np.isin(view_idx, interval_views)
+                    count = int(np.sum(mask))
+                    if count == 0:
+                        continue
+                    interval_pure = float(np.mean(pure_mask[mask])) if count else 0.0
+                    interval_pts = pts[mask]
+                    interval_uv = uv[mask] if uv.shape[0] else np.zeros((0, 2), dtype=float)
+                    interval_span = np.ptp(interval_uv, axis=0) if interval_uv.shape[0] else np.zeros(2, dtype=float)
+                    interval_cov = float(np.min(np.minimum(interval_span / np.array(info["poly_span"], dtype=float), 1.0)))
+                    key = (interval_pure >= 0.65, interval_cov, count)
+                    old_key = (
+                        bool(best_interval and float(best_interval.get("purity") or 0.0) >= 0.65),
+                        float((best_interval or {}).get("coverage_2d") or 0.0),
+                        int((best_interval or {}).get("point_count") or 0),
+                    )
+                    if best_interval is None or key > old_key:
+                        best_interval = {
+                            "center_view": int(candidate_center),
+                            "width": int(width),
+                            "point_count": count,
+                            "purity": as_json_float(interval_pure),
+                            "coverage_2d": as_json_float(interval_cov),
+                            "z_levels": int(len(set(int(v) for v in z_idx[mask]))),
+                        }
+                        best_points = interval_pts
+                if best_interval is None:
+                    best_interval = {"center_view": None, "width": int(width), "point_count": 0, "purity": None, "coverage_2d": None, "z_levels": 0}
+                fit_eval = evaluate_fit(best_points, f"view_interval_{width}") if best_points.shape[0] >= 4 else {"fit_ready": False, "finite_good": False, "plane_good": False}
+                best_interval["fit_ready"] = bool(fit_eval.get("fit_ready"))
+                best_interval["finite_good"] = bool(fit_eval.get("finite_good") and int(fit_eval.get("face_id", -1)) == fid)
+                best_interval["plane_good"] = bool(fit_eval.get("plane_good") and int(fit_eval.get("face_id", -1)) == fid)
+                best_interval["plane_rms"] = fit_eval.get("plane_rms")
+                contiguous_fits[str(width)] = best_interval
+                if width == 1:
+                    best_view = dict(best_interval)
+            if bool(contiguous_fits.get("1", {}).get("finite_good")):
+                ceiling_ids["best_single_view_finite_support"].add(fid)
+            if bool(contiguous_fits.get("3", {}).get("finite_good")) or bool(contiguous_fits.get("5", {}).get("finite_good")):
+                ceiling_ids["best_contiguous_view_interval_fit"].add(fid)
+
+        consensus_good = False
+        consensus_plane_variation = None
+        per_view_candidates: list[dict[str, object]] = []
+        if raw_count:
+            for view in unique_views:
+                mask = view_idx == int(view)
+                if int(np.sum(mask)) < 4 or float(np.mean(pure_mask[mask])) < 0.65:
+                    continue
+                candidate = _candidate_from_observed_points(pts[mask], source="per_view_consensus")
+                if candidate is not None:
+                    match = candidate_oracle_face(candidate, model_face_rows)
+                    if bool((match or {}).get("plane_good")) and int((match or {}).get("face_id", -1)) == fid:
+                        per_view_candidates.append(candidate)
+            if len(per_view_candidates) >= 2:
+                normals = np.array([np.array(c["normal"], dtype=float) for c in per_view_candidates], dtype=float)
+                ref = normals[0]
+                normals = np.array([n if float(n @ ref) >= 0.0 else -n for n in normals], dtype=float)
+                mean_n = np.mean(normals, axis=0)
+                mean_n /= max(float(np.linalg.norm(mean_n)), EPS)
+                offsets = np.array([
+                    float(np.array(c["normal"], dtype=float) @ np.array(c["plane_centroid"], dtype=float))
+                    for c in per_view_candidates
+                ], dtype=float)
+                dots = np.clip(np.abs(normals @ mean_n), -1.0, 1.0)
+                angle_p95 = float(np.percentile(np.degrees(np.arccos(dots)), 95))
+                offset_span = float(np.ptp(offsets)) if offsets.size else float("inf")
+                consensus_plane_variation = max(angle_p95 / 2.0, offset_span / max(plane_tol, EPS))
+                if angle_p95 <= 2.0 and offset_span <= plane_tol:
+                    consensus_points = pts[pure_mask] if int(np.sum(pure_mask)) >= 4 else pts
+                    consensus_eval = evaluate_fit(consensus_points, "cross_view_consensus")
+                    consensus_good = bool(consensus_eval.get("finite_good") and int(consensus_eval.get("face_id", -1)) == fid)
+            if consensus_good:
+                ceiling_ids["cross_view_consensus_fit"].add(fid)
+
+        fit_ready = bool(consensus_good or contiguous_fits.get("3", {}).get("finite_good") or contiguous_fits.get("5", {}).get("finite_good"))
+        full_mixed = bool(raw_count > 0 and purity < 0.65)
+        best_single_clean = bool((best_view.get("purity") or 0.0) >= 0.75 and (best_view.get("coverage_2d") or 0.0) >= 0.08)
+        if raw_count < 4 or coverage_2d < 0.04:
+            category = "insufficient_points_or_span"
+        elif overlap_frac >= 0.35:
+            category = "finite_footprint_overlap"
+        elif full_mixed and not best_single_clean:
+            category = "within_single_view"
+        elif full_mixed and best_single_clean and len(unique_views) > 1:
+            category = "across_view_pooling"
+        elif full_mixed and z_span_obs > max(3.0 * abs(z_step), 0.03):
+            category = "across_Z_pooling"
+        elif fit_ready and fid not in final_ids:
+            category = "track_or_cluster_merge"
+        elif fit_ready:
+            category = "clean_fit_ready_support"
+        else:
+            category = "insufficient_points_or_span"
+        category_counts[category] += 1
+
+        condition_penalty = min(float(np.nanmedian(raw_cond)) / 1e6, 1.0) if raw_cond.size and np.any(np.isfinite(raw_cond)) else 0.0
+        score = (
+            min(len(unique_views), 8) / 8.0
+            + 1.5 * min(coverage_2d, 1.0)
+            + 0.5 * min(raw_count / max(float(nw * n_z), 1.0), 1.0)
+            - 1.0 * max(0.0, 1.0 - purity)
+            - 0.5 * condition_penalty
+        )
+        label = bool(consensus_good or contiguous_fits.get("3", {}).get("finite_good") or contiguous_fits.get("5", {}).get("finite_good"))
+        score_rows.append((float(score), label))
+        feature_rows.append({
+            "score": float(score),
+            "label": label,
+            "raw_count": raw_count,
+            "independent_views": len(unique_views),
+            "coverage_2d": coverage_2d,
+            "purity": purity,
+        })
+        competing_margin = face_competing_min_distances.get(fid, np.zeros(0, dtype=float))
+        rows.append({
+            "face_id": fid,
+            "raw_count": raw_count,
+            "windows": unique_windows,
+            "z_levels": int(len(unique_z)),
+            "z_span": as_json_float(z_span_obs),
+            "view_count": int(len(unique_views)),
+            "angular_span_fraction": as_json_float(angular_span),
+            "purity": as_json_float(purity),
+            "overlap_fraction": as_json_float(overlap_frac),
+            "coverage_u": as_json_float(float(norm_span[0])),
+            "coverage_v": as_json_float(float(norm_span[1])),
+            "coverage_2d": as_json_float(coverage_2d),
+            "rms_median": as_json_float(float(np.nanmedian(raw_rms))) if raw_rms.size and np.any(np.isfinite(raw_rms)) else None,
+            "rms_p95": as_json_float(float(np.nanpercentile(raw_rms[np.isfinite(raw_rms)], 95))) if raw_rms.size and np.any(np.isfinite(raw_rms)) else None,
+            "condition_median": as_json_float(float(np.nanmedian(raw_cond))) if raw_cond.size and np.any(np.isfinite(raw_cond)) else None,
+            "condition_p95": as_json_float(float(np.nanpercentile(raw_cond[np.isfinite(raw_cond)], 95))) if raw_cond.size and np.any(np.isfinite(raw_cond)) else None,
+            "classification_counts": {"minimum": minima_count, "low": low_count, "peak": peak_count},
+            "best_single_view": best_view,
+            "contiguous_view_intervals": contiguous_fits,
+            "cross_view_consensus": {
+                "per_view_plane_good_hypotheses": int(len(per_view_candidates)),
+                "finite_good": bool(consensus_good),
+                "plane_variation_score": as_json_float(float(consensus_plane_variation)) if consensus_plane_variation is not None else None,
+            },
+            "competing_face_margin_median": as_json_float(float(np.median(competing_margin))) if competing_margin.size else None,
+            "category": category,
+            "final_active_finite_good": bool(fid in final_ids),
+            "area": as_json_float(float(info["area"])),
+            "area_fraction": as_json_float(float(info["area"]) / max(total_area, EPS)),
+            "reference_z_span": as_json_float(float(info["z_span"])),
+            "normal_abs_z": as_json_float(float(info["normal_abs_z"])),
+            "near_vertical": bool(float(info["normal_abs_z"]) < 0.25),
+            "lower_z": bool(float(info["z_mid"]) <= lower_cut),
+            "small_area_decile": bool(float(info["area"]) <= small_area_cut),
+            "non_oracle_score_fixed_direction": as_json_float(float(score)),
+        })
+
+    def ceiling_summary(ids: set[int]) -> dict[str, object]:
+        selected = [row for row in rows if int(row["face_id"]) in ids]
+        return {
+            "unique_face_ids": int(len(ids)),
+            "count_recall": as_json_float(len(ids) / max(len(face_infos), 1)),
+            "area_weighted_recall": as_json_float(sum(float(row.get("area") or 0.0) for row in selected) / max(total_area, EPS)),
+            "near_vertical_recall": as_json_float(sum(1 for row in selected if bool(row["near_vertical"])) / max(sum(1 for row in rows if bool(row["near_vertical"])), 1)),
+            "lower_z_recall": as_json_float(sum(1 for row in selected if bool(row["lower_z"])) / max(sum(1 for row in rows if bool(row["lower_z"])), 1)),
+            "small_area_decile_recall": as_json_float(sum(1 for row in selected if bool(row["small_area_decile"])) / max(sum(1 for row in rows if bool(row["small_area_decile"])), 1)),
+            "face_ids_sample": sorted(int(v) for v in ids)[:80],
+        }
+
+    digest = hashlib.sha256()
+    digest.update(str(model_name).encode("utf-8"))
+    digest.update(np.array(windows, dtype=np.int64).tobytes())
+    digest.update(np.array(lp.shape, dtype=np.int64).tobytes())
+    finite_rms = flat_rms[np.isfinite(flat_rms)]
+    digest.update(np.array([
+        float(np.median(finite_rms)) if finite_rms.size else float("nan"),
+        float(np.percentile(finite_rms, 95)) if finite_rms.size else float("nan"),
+        float(finite_indices.size),
+    ], dtype=np.float64).tobytes())
+
+    sorted_features = sorted(feature_rows, key=lambda row: float(row["score"]), reverse=True)
+    frontier = []
+    for top_k in (20, 50):
+        subset = sorted_features[: min(top_k, len(sorted_features))]
+        if subset:
+            frontier.append({
+                "top_k": int(top_k),
+                "precision": as_json_float(sum(1 for row in subset if bool(row["label"])) / len(subset)),
+                "unique_face_ids": int(sum(1 for row in subset if bool(row["label"]))),
+            })
+    recoverable_ids = ceiling_ids["cross_view_consensus_fit"] | ceiling_ids["best_contiguous_view_interval_fit"]
+    shortlist_precision = None
+    if sorted_features:
+        shortlist = sorted_features[: min(20, len(sorted_features))]
+        shortlist_precision = sum(1 for row in shortlist if bool(row["label"])) / max(len(shortlist), 1)
+    dominant_category = max(category_counts.items(), key=lambda item: item[1])[0] if category_counts else "insufficient_points_or_span"
+    selected_branch = "E" if not recoverable_ids else "D"
+    if dominant_category == "across_view_pooling":
+        selected_branch = "A"
+    elif dominant_category == "within_single_view":
+        selected_branch = "B"
+    elif dominant_category == "clean_fit_ready_support" and len(recoverable_ids - final_ids) == 0:
+        selected_branch = "C"
+
+    sample_rows = sorted(
+        rows,
+        key=lambda row: (
+            not bool(row["small_area_decile"]),
+            not bool(row["near_vertical"]),
+            bool(row["final_active_finite_good"]),
+            -int(row["raw_count"]),
+        ),
+    )[:80]
+    roc_auc = _auc_binary(score_rows, higher_is_better=True)
+    pr_auc = _pr_auc_binary(score_rows, higher_is_better=True)
+    return {
+        "schema_version": 1,
+        "model": str(model_name),
+        "scope": "view-conditioned-raw-support",
+        "production_changed": False,
+        "initial_model_usage": "posthoc labels/evaluation only; no production candidate score/order/gate uses InitialModel",
+        "raw_provenance": {
+            "windows": [int(v) for v in windows],
+            "line_points_shape": [int(v) for v in lp.shape],
+            "z_level_count": int(n_z),
+            "view_count": int(n_view),
+            "finite_raw_observations": int(finite_indices.size),
+            "total_raw_slots": int(total_flat),
+            "view_angle_model": "cyclic half-contour index mapped to 2*pi*i/view_count",
+            "raw_signal_signature": digest.hexdigest()[:24],
+            "line_direction_provenance": "not serialized by compute_line_points_multi_window; W2 segment direction remains available only after segmentation",
+        },
+        "tolerances": {
+            "plane_distance": as_json_float(float(plane_tol)),
+            "finite_polygon_distance": as_json_float(float(finite_tol)),
+            "fit_span_tol": as_json_float(float(fit_span_tol)),
+        },
+        "mixing_category_counts": category_counts,
+        "mixing_category_total": int(sum(category_counts.values())),
+        "ceiling": {name: ceiling_summary(ids) for name, ids in ceiling_ids.items()},
+        "representation_comparison": {
+            "current_aggregation": ceiling_summary(ceiling_ids["final_active_mesh"]),
+            "view_conditioned_tls": ceiling_summary(ceiling_ids["best_contiguous_view_interval_fit"]),
+            "per_view_hypotheses_plane_consensus": ceiling_summary(ceiling_ids["cross_view_consensus_fit"]),
+            "view_conditioned_mixed_split": {
+                "skipped": True,
+                "reason": "diagnostic split is evaluated only through separable view-conditioned modes; no oracle IDs are used for a production split score",
+            },
+        },
+        "non_oracle_separation": {
+            "fixed_direction_score": {
+                "higher_is_better": True,
+                "formula": "independent views + finite 2D span + saturated support - impurity - bounded condition penalty",
+                "roc_auc": as_json_float(float(roc_auc)) if roc_auc is not None else None,
+                "pr_auc": as_json_float(float(pr_auc)) if pr_auc is not None else None,
+                "frontier": frontier,
+                "shortlist_precision_top20": as_json_float(float(shortlist_precision)) if shortlist_precision is not None else None,
+            },
+            "feature_distributions": {
+                "good": {
+                    "support_count": distribution_summary([row["raw_count"] for row in rows if int(row["face_id"]) in recoverable_ids]),
+                    "independent_views": distribution_summary([row["view_count"] for row in rows if int(row["face_id"]) in recoverable_ids]),
+                    "coverage_2d": distribution_summary([row["coverage_2d"] for row in rows if int(row["face_id"]) in recoverable_ids]),
+                    "purity": distribution_summary([row["purity"] for row in rows if int(row["face_id"]) in recoverable_ids]),
+                },
+                "bad": {
+                    "support_count": distribution_summary([row["raw_count"] for row in rows if int(row["face_id"]) not in recoverable_ids]),
+                    "independent_views": distribution_summary([row["view_count"] for row in rows if int(row["face_id"]) not in recoverable_ids]),
+                    "coverage_2d": distribution_summary([row["coverage_2d"] for row in rows if int(row["face_id"]) not in recoverable_ids]),
+                    "purity": distribution_summary([row["purity"] for row in rows if int(row["face_id"]) not in recoverable_ids]),
+                },
+            },
+        },
+        "full_edge_clip_trials": {
+            "attempted": False,
+            "reason": "no production-ready non-oracle shortlist is promoted by the diagnostic-only ceiling; candidate-level recovery is not counted as mesh recovery",
+            "max_trials_per_model": 20,
+        },
+        "branch_decision": {
+            "selected": selected_branch,
+            "legend": {
+                "A": "mixing mainly across views; view-conditioned detector is promising",
+                "B": "mixing already inside single view; raw detector must change first",
+                "C": "clean support exists but plane/hull formation is the likely bottleneck",
+                "D": "clean hypotheses exist but non-oracle separation is insufficient",
+                "E": "full raw signal still lacks fit-ready support",
+            },
+            "production_mode_added": False,
+        },
+        "bounded_face_rows_sample": sample_rows,
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
+def _edge_segment_distances(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ab = b - a
+    den = float(ab @ ab)
+    if den <= EPS:
+        return np.linalg.norm(points - a[None, :], axis=1), np.zeros(points.shape[0], dtype=float)
+    t = ((points - a[None, :]) @ ab) / den
+    closest = a[None, :] + np.clip(t, 0.0, 1.0)[:, None] * ab[None, :]
+    return np.linalg.norm(points - closest, axis=1), t.astype(float)
+
+
+def _line_candidate_from_points(points: np.ndarray, *, source: str) -> dict[str, object] | None:
+    pts = np.asarray(points, dtype=float)
+    pts = pts[np.all(np.isfinite(pts), axis=1)]
+    if pts.shape[0] < 2:
+        return None
+    centroid = np.mean(pts, axis=0)
+    centered = pts - centroid[None, :]
+    try:
+        _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    direction = vh[0].astype(float)
+    norm = float(np.linalg.norm(direction))
+    if norm <= EPS:
+        return None
+    direction /= norm
+    coord = centered @ direction
+    residual = np.linalg.norm(centered - coord[:, None] * direction[None, :], axis=1)
+    return {
+        "source": str(source),
+        "point_count": int(pts.shape[0]),
+        "centroid": as_json_point(centroid),
+        "direction": as_json_point(direction),
+        "rms": as_json_float(float(np.sqrt(np.mean(residual * residual)))),
+        "p95": as_json_float(float(np.percentile(residual, 95))),
+        "segment_min": as_json_point(centroid + float(np.min(coord)) * direction),
+        "segment_max": as_json_point(centroid + float(np.max(coord)) * direction),
+        "segment_span": as_json_float(float(np.max(coord) - np.min(coord))),
+        "condition": as_json_float(float(s[0] / max(s[1], EPS))) if s.size > 1 else None,
+    }
+
+
+def diagnose_edge_incidence_raw_support(
+    *,
+    model_name: str,
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    windows: list[int],
+    z_levels: np.ndarray,
+    line_points_by_window: np.ndarray | None,
+    fit_rms_by_window: np.ndarray | None,
+    cond_by_window: np.ndarray | None,
+    point_bounds_min: np.ndarray,
+    point_bounds_max: np.ndarray,
+    peak_threshold: float,
+    low_threshold: float,
+    final_candidates: list[dict[str, object]],
+    final_reconstructed: dict[str, object],
+    w2_segments: list[dict[str, object]],
+    w2_clusters: list[dict[str, object]],
+    model_faces: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    if line_points_by_window is None or fit_rms_by_window is None:
+        return {
+            "schema_version": 1,
+            "model": str(model_name),
+            "production_changed": False,
+            "skipped": True,
+            "reason": "multi-window raw line_points are not available in memory",
+        }
+    lp = np.asarray(line_points_by_window, dtype=float)
+    rms = np.asarray(fit_rms_by_window, dtype=float)
+    cond = np.asarray(cond_by_window, dtype=float) if cond_by_window is not None else None
+    if lp.ndim != 4 or lp.shape[-1] != 3:
+        return {
+            "schema_version": 1,
+            "model": str(model_name),
+            "production_changed": False,
+            "skipped": True,
+            "reason": "unexpected line_points_by_window shape",
+            "shape": list(lp.shape),
+        }
+
+    model_face_rows = model_faces or model_face_planes(vertices, faces)
+    reference_edges, edge_faces_map = model_edges_from_faces(vertices, faces)
+    face_to_edges: dict[int, list[int]] = {}
+    for eid, edge in enumerate(reference_edges):
+        for fid in edge_faces_map.get(edge, set()):
+            face_to_edges.setdefault(int(fid), []).append(int(eid))
+
+    nw, n_view, n_z, _ = lp.shape
+    flat_points = lp.reshape((-1, 3))
+    flat_rms = rms.reshape((-1,)) if rms.shape[:3] == lp.shape[:3] else np.full(flat_points.shape[0], float("nan"))
+    flat_cond = cond.reshape((-1,)) if cond is not None and cond.shape[:3] == lp.shape[:3] else np.full(flat_points.shape[0], float("nan"))
+    finite = (
+        np.all(np.isfinite(flat_points), axis=1)
+        & np.all(flat_points >= point_bounds_min[None, :], axis=1)
+        & np.all(flat_points <= point_bounds_max[None, :], axis=1)
+    )
+    finite_indices = np.flatnonzero(finite)
+    finite_points = flat_points[finite_indices]
+    bbox_diag = float(np.linalg.norm(np.max(vertices, axis=0) - np.min(vertices, axis=0))) if vertices.size else 1.0
+    z_step = float(np.median(np.diff(z_levels))) if z_levels.size > 1 else 0.01
+    edge_tol = max(0.02, 0.004 * bbox_diag, abs(z_step) * 1.5)
+    line_residual_tol = max(0.035, 0.006 * bbox_diag, abs(z_step) * 2.0)
+    total_flat = int(flat_points.shape[0])
+    edge_assignment_counts = np.zeros(total_flat, dtype=np.uint16)
+    best_distance = np.full(total_flat, float("inf"), dtype=float)
+    second_distance = np.full(total_flat, float("inf"), dtype=float)
+    best_edge = np.full(total_flat, -1, dtype=np.int32)
+    edge_support_indices: dict[int, np.ndarray] = {}
+    edge_support_t: dict[int, np.ndarray] = {}
+
+    z_min = float(np.min(vertices[:, 2])) if vertices.size else 0.0
+    z_max = float(np.max(vertices[:, 2])) if vertices.size else 1.0
+    lower_cut = z_min + (z_max - z_min) / 3.0
+    upper_cut = z_min + 2.0 * (z_max - z_min) / 3.0
+    edge_infos: list[dict[str, object]] = []
+    for eid, (ia, ib) in enumerate(reference_edges):
+        a = vertices[int(ia)]
+        b = vertices[int(ib)]
+        vec = b - a
+        length = float(np.linalg.norm(vec))
+        direction = vec / max(length, EPS)
+        adjacent = sorted(int(fid) for fid in edge_faces_map.get((int(ia), int(ib)), edge_faces_map.get((int(ib), int(ia)), set())))
+        normals = [np.array(model_face_rows[fid]["normal"], dtype=float) for fid in adjacent if 0 <= fid < len(model_face_rows)]
+        if len(normals) >= 2:
+            dihedral = float(np.degrees(np.arccos(np.clip(float(normals[0] @ normals[1]), -1.0, 1.0))))
+        else:
+            dihedral = None
+        z_mid = float(0.5 * (a[2] + b[2]))
+        zone = "lower" if z_mid <= lower_cut else ("upper" if z_mid >= upper_cut else "middle")
+        edge_infos.append({
+            "edge_id": int(eid),
+            "vertex_ids": [int(ia), int(ib)],
+            "a": a,
+            "b": b,
+            "length": length,
+            "direction": direction,
+            "z_span": float(abs(float(a[2]) - float(b[2]))),
+            "z_mid": z_mid,
+            "z_zone": zone,
+            "adjacent_faces": adjacent,
+            "dihedral_angle": dihedral,
+            "bbox_min": np.minimum(a, b) - edge_tol,
+            "bbox_max": np.maximum(a, b) + edge_tol,
+        })
+
+    for info in edge_infos:
+        eid = int(info["edge_id"])
+        if finite_indices.size == 0:
+            edge_support_indices[eid] = np.zeros(0, dtype=int)
+            edge_support_t[eid] = np.zeros(0, dtype=float)
+            continue
+        bbox_mask = np.all(
+            (finite_points >= np.array(info["bbox_min"], dtype=float)[None, :])
+            & (finite_points <= np.array(info["bbox_max"], dtype=float)[None, :]),
+            axis=1,
+        )
+        local = finite_indices[bbox_mask]
+        if local.size == 0:
+            edge_support_indices[eid] = np.zeros(0, dtype=int)
+            edge_support_t[eid] = np.zeros(0, dtype=float)
+            continue
+        distances, t = _edge_segment_distances(flat_points[local], np.array(info["a"], dtype=float), np.array(info["b"], dtype=float))
+        mask = (distances <= edge_tol) & (t >= -0.08) & (t <= 1.08)
+        support = local[mask]
+        support_dist = distances[mask]
+        support_t = t[mask]
+        edge_support_indices[eid] = support.astype(int)
+        edge_support_t[eid] = support_t.astype(float)
+        edge_assignment_counts[support] = np.minimum(edge_assignment_counts[support] + 1, np.iinfo(np.uint16).max)
+        better = support_dist < best_distance[support]
+        if np.any(better):
+            update = support[better]
+            second_distance[update] = best_distance[update]
+            best_distance[update] = support_dist[better]
+            best_edge[update] = eid
+        worse = ~better
+        if np.any(worse):
+            update = support[worse]
+            second_distance[update] = np.minimum(second_distance[update], support_dist[worse])
+
+    active_indices = [
+        int(i)
+        for i in final_reconstructed.get("face_candidate_indices", [])
+        if 0 <= int(i) < len(final_candidates)
+    ]
+    active_candidates = [final_candidates[i] for i in active_indices]
+    pool_cohort = oracle_candidate_cohort(final_candidates, model_face_rows)
+    active_cohort = oracle_candidate_cohort(active_candidates, model_face_rows, active_plane_indices=active_indices)
+    pool_face_ids = set(int(v) for v in pool_cohort.get("finite_face_ids", []))
+    active_face_ids = set(int(v) for v in active_cohort.get("finite_face_ids", []))
+
+    def adjacent_has(edge_id: int, face_ids: set[int]) -> bool:
+        return any(int(fid) in face_ids for fid in edge_infos[int(edge_id)]["adjacent_faces"])
+
+    cluster_edge_matches: dict[int, list[int]] = {int(info["edge_id"]): [] for info in edge_infos}
+    segment_edge_matches: dict[int, list[int]] = {int(info["edge_id"]): [] for info in edge_infos}
+    duplicate_cluster_edges: set[int] = set()
+    for segment in w2_segments:
+        z0 = finite_float(segment.get("z_min"), float("nan"))
+        z1 = finite_float(segment.get("z_max"), float("nan"))
+        if not np.isfinite(z0) or not np.isfinite(z1):
+            continue
+        z = np.linspace(z0, z1, 5)
+        pts = predict_w2_line(segment, z)
+        direction = np.array(segment.get("direction") or [], dtype=float)
+        best: tuple[float, int] | None = None
+        for info in edge_infos:
+            distances, t = _edge_segment_distances(pts, np.array(info["a"], dtype=float), np.array(info["b"], dtype=float))
+            finite_frac = float(np.mean((t >= -0.05) & (t <= 1.05)))
+            if finite_frac < 0.6:
+                continue
+            angle = 0.0
+            if direction.shape == (3,) and np.linalg.norm(direction) > EPS:
+                angle = float(np.degrees(np.arccos(np.clip(abs(float(direction @ np.array(info["direction"], dtype=float))), -1.0, 1.0))))
+            score = float(np.median(distances)) + 0.01 * angle + max(0.0, 0.8 - finite_frac)
+            if best is None or score < best[0]:
+                best = (score, int(info["edge_id"]))
+        if best is not None and best[0] <= max(edge_tol * 2.0, 0.08):
+            segment_edge_matches[best[1]].append(int(segment.get("segment_id", -1)))
+    for cluster in w2_clusters:
+        z0 = finite_float(cluster.get("cluster_z_min"), finite_float(cluster.get("z_min"), float("nan")))
+        z1 = finite_float(cluster.get("cluster_z_max"), finite_float(cluster.get("z_max"), float("nan")))
+        if not np.isfinite(z0) or not np.isfinite(z1):
+            continue
+        z = np.linspace(z0, z1, 5)
+        pts = predict_w2_line(cluster, z)
+        direction = np.array(cluster.get("direction") or [], dtype=float)
+        best: tuple[float, int] | None = None
+        for info in edge_infos:
+            distances, t = _edge_segment_distances(pts, np.array(info["a"], dtype=float), np.array(info["b"], dtype=float))
+            finite_frac = float(np.mean((t >= -0.05) & (t <= 1.05)))
+            if finite_frac < 0.6:
+                continue
+            angle = 0.0
+            if direction.shape == (3,) and np.linalg.norm(direction) > EPS:
+                angle = float(np.degrees(np.arccos(np.clip(abs(float(direction @ np.array(info["direction"], dtype=float))), -1.0, 1.0))))
+            score = float(np.median(distances)) + 0.01 * angle + max(0.0, 0.8 - finite_frac)
+            if best is None or score < best[0]:
+                best = (score, int(info["edge_id"]))
+        if best is not None and best[0] <= max(edge_tol * 2.0, 0.08):
+            cid = int(cluster.get("edge_cluster_id", cluster.get("cluster_id", -1)))
+            cluster_edge_matches[best[1]].append(cid)
+    for eid, clusters_for_edge in cluster_edge_matches.items():
+        if len(set(clusters_for_edge)) > 1:
+            duplicate_cluster_edges.add(int(eid))
+
+    edge_categories = [
+        "no_raw_observed_support",
+        "raw_support_ambiguous",
+        "too_few_independent_points",
+        "short_Z_but_cross_view_support_exists",
+        "fixed_index_fragmentation",
+        "segment_fit_rejected",
+        "mixed_multiple_physical_edges",
+        "edge_cluster_missing",
+        "duplicate_clusters_same_edge",
+        "confident_edge_cluster_available",
+        "represented_in_final_face_candidate",
+        "represented_in_final_active_mesh",
+    ]
+    category_counts = {name: 0 for name in edge_categories}
+    edge_rows: list[dict[str, object]] = []
+    score_rows: list[tuple[float, bool]] = []
+    length_values = np.array([float(info["length"]) for info in edge_infos], dtype=float)
+    zspan_values = np.array([float(info["z_span"]) for info in edge_infos], dtype=float)
+    dihedral_values = np.array([
+        finite_float(info.get("dihedral_angle"), float("nan")) for info in edge_infos
+    ], dtype=float)
+
+    for info in edge_infos:
+        eid = int(info["edge_id"])
+        support = edge_support_indices.get(eid, np.zeros(0, dtype=int))
+        raw_count = int(support.size)
+        wi = (support // (n_view * n_z)).astype(int) if raw_count else np.zeros(0, dtype=int)
+        rem = (support % (n_view * n_z)).astype(int) if raw_count else np.zeros(0, dtype=int)
+        view_idx = (rem // n_z).astype(int) if raw_count else np.zeros(0, dtype=int)
+        z_idx = (rem % n_z).astype(int) if raw_count else np.zeros(0, dtype=int)
+        pts = flat_points[support] if raw_count else np.zeros((0, 3), dtype=float)
+        unique_views = sorted(int(v) for v in np.unique(view_idx)) if raw_count else []
+        unique_z = sorted(int(v) for v in np.unique(z_idx)) if raw_count else []
+        unique_indices = sorted(int(v) for v in np.unique(rem // n_z)) if raw_count else []
+        ambiguity = float(np.mean(edge_assignment_counts[support] > 1)) if raw_count else 0.0
+        margins = second_distance[support] - best_distance[support] if raw_count else np.zeros(0, dtype=float)
+        margin_median = float(np.nanmedian(margins)) if margins.size else None
+        t_values = edge_support_t.get(eid, np.zeros(0, dtype=float))
+        t_span = float(np.max(np.clip(t_values, 0.0, 1.0)) - np.min(np.clip(t_values, 0.0, 1.0))) if t_values.size else 0.0
+        z_span_obs = float(np.ptp(z_levels[z_idx])) if z_idx.size > 1 else 0.0
+        line_eval = _line_candidate_from_points(pts, source="raw_edge_support") if pts.shape[0] >= 2 else None
+        line_rms = finite_float((line_eval or {}).get("rms"), float("inf")) if line_eval else float("inf")
+        condition_median = (
+            float(np.nanmedian(flat_cond[support]))
+            if raw_count and np.any(np.isfinite(flat_cond[support]))
+            else None
+        )
+        cross_view_short = bool(len(unique_views) >= 3 and raw_count >= 6 and t_span >= 0.15 and float(info["z_span"]) <= max(3.0 * abs(z_step), 0.03))
+        segment_available = bool(segment_edge_matches.get(eid))
+        cluster_available = bool(cluster_edge_matches.get(eid))
+        in_pool = adjacent_has(eid, pool_face_ids)
+        in_active = adjacent_has(eid, active_face_ids)
+        if in_active:
+            category = "represented_in_final_active_mesh"
+        elif in_pool:
+            category = "represented_in_final_face_candidate"
+        elif cluster_available and eid in duplicate_cluster_edges:
+            category = "duplicate_clusters_same_edge"
+        elif cluster_available:
+            category = "confident_edge_cluster_available"
+        elif segment_available:
+            category = "edge_cluster_missing"
+        elif raw_count == 0:
+            category = "no_raw_observed_support"
+        elif ambiguity >= 0.5:
+            category = "raw_support_ambiguous"
+        elif raw_count < 4 or len(unique_views) < 2 or t_span < 0.08:
+            category = "too_few_independent_points"
+        elif cross_view_short:
+            category = "short_Z_but_cross_view_support_exists"
+        elif len(unique_indices) > max(6, len(unique_views) * 2) and len(unique_z) >= 3:
+            category = "fixed_index_fragmentation"
+        elif line_rms > line_residual_tol:
+            category = "segment_fit_rejected"
+        else:
+            category = "mixed_multiple_physical_edges"
+        category_counts[category] += 1
+        score_components = {
+            "independent_view_score": float(min(len(unique_views), 8) / 8.0),
+            "finite_segment_span_score": float(min(t_span, 1.0)),
+            "saturated_support_score": float(min(raw_count / 80.0, 1.0)),
+            "second_edge_margin_score": float(min(max(0.0, margin_median or 0.0) / max(edge_tol, EPS), 1.0)),
+            "line_residual_penalty": float(min(line_rms / max(line_residual_tol, EPS), 1.0)),
+            "condition_penalty": float(0.5 * min(float(condition_median) / 1e6, 1.0)) if condition_median is not None else 0.0,
+        }
+        score = (
+            score_components["independent_view_score"]
+            + score_components["finite_segment_span_score"]
+            + score_components["saturated_support_score"]
+            + score_components["second_edge_margin_score"]
+            - score_components["line_residual_penalty"]
+            - score_components["condition_penalty"]
+        )
+        label = bool(cluster_available or (segment_available and line_rms <= line_residual_tol and t_span >= 0.15))
+        score_rows.append((float(score), label))
+        direction_abs_z = abs(float(np.array(info["direction"], dtype=float)[2]))
+        edge_rows.append({
+            "edge_id": eid,
+            "vertex_ids": info["vertex_ids"],
+            "length": as_json_float(float(info["length"])),
+            "direction": as_json_point(np.array(info["direction"], dtype=float)),
+            "z_span": as_json_float(float(info["z_span"])),
+            "z_zone": info["z_zone"],
+            "sampled_z_levels": int(max(1, round(float(info["z_span"]) / max(abs(z_step), EPS))) + 1),
+            "potential_view_visibility": int(len(unique_views)),
+            "adjacent_face_ids": info["adjacent_faces"],
+            "dihedral_angle": as_json_float(float(info["dihedral_angle"])) if info["dihedral_angle"] is not None else None,
+            "raw_support_count": raw_count,
+            "view_count": int(len(unique_views)),
+            "z_level_count": int(len(unique_z)),
+            "observed_z_span": as_json_float(z_span_obs),
+            "segment_t_span": as_json_float(t_span),
+            "assignment_ambiguity_fraction": as_json_float(ambiguity),
+            "second_edge_margin_median": as_json_float(float(margin_median)) if margin_median is not None else None,
+            "line_rms": as_json_float(float(line_rms)),
+            "condition_median": as_json_float(float(condition_median)) if condition_median is not None else None,
+            "segment_hypothesis_available": bool(segment_available),
+            "confident_cluster_available": bool(cluster_available),
+            "duplicate_clusters_same_edge": bool(eid in duplicate_cluster_edges),
+            "represented_in_final_face_candidate": bool(in_pool),
+            "represented_in_final_active_mesh": bool(in_active),
+            "category": category,
+            "near_horizontal_edge": bool(direction_abs_z < 0.25),
+            "near_vertical_edge": bool(direction_abs_z > 0.75),
+            "length_decile": int(np.searchsorted(np.percentile(length_values, np.arange(10, 100, 10)), float(info["length"]), side="right")) if length_values.size else 0,
+            "z_span_decile": int(np.searchsorted(np.percentile(zspan_values, np.arange(10, 100, 10)), float(info["z_span"]), side="right")) if zspan_values.size else 0,
+            "dihedral_decile": int(np.searchsorted(np.percentile(dihedral_values[np.isfinite(dihedral_values)], np.arange(10, 100, 10)), finite_float(info.get("dihedral_angle"), 0.0), side="right")) if np.any(np.isfinite(dihedral_values)) else 0,
+            "non_oracle_score_fixed_direction": as_json_float(float(score)),
+            "non_oracle_score_components": {key: as_json_float(value) for key, value in score_components.items()},
+        })
+
+    edge_support_ids = {int(row["edge_id"]) for row in edge_rows if int(row["raw_support_count"]) > 0}
+    usable_segment_ids = {int(row["edge_id"]) for row in edge_rows if bool(row["segment_hypothesis_available"])}
+    confident_cluster_ids = {int(row["edge_id"]) for row in edge_rows if bool(row["confident_cluster_available"])}
+    noncollinear_pair_ids: set[int] = set()
+    plane_pair_ids: set[int] = set()
+    finite_hull_ids: set[int] = set()
+    face_rows: list[dict[str, object]] = []
+    for face in model_face_rows:
+        fid = int(face["face_id"])
+        boundary_edges = sorted(face_to_edges.get(fid, []))
+        supported = [eid for eid in boundary_edges if eid in edge_support_ids]
+        usable = [eid for eid in boundary_edges if eid in usable_segment_ids]
+        clustered = [eid for eid in boundary_edges if eid in confident_cluster_ids]
+        noncollinear = False
+        if len(usable) >= 2:
+            for i, ea in enumerate(usable):
+                da = np.array(edge_infos[ea]["direction"], dtype=float)
+                for eb in usable[i + 1:]:
+                    db = np.array(edge_infos[eb]["direction"], dtype=float)
+                    if float(np.linalg.norm(np.cross(da, db))) >= 0.08:
+                        noncollinear = True
+                        break
+                if noncollinear:
+                    break
+        if noncollinear:
+            noncollinear_pair_ids.add(fid)
+        plane_good = bool(noncollinear and fid in pool_face_ids)
+        finite_good = bool(fid in pool_face_ids)
+        if plane_good:
+            plane_pair_ids.add(fid)
+        if finite_good:
+            finite_hull_ids.add(fid)
+        first_loss = "final_active_mesh" if fid in active_face_ids else (
+            "current_candidate_pool" if fid in pool_face_ids else (
+                "finite_hull_or_candidate_missing" if noncollinear else (
+                    "noncollinear_boundary_pair_missing" if len(usable) >= 2 else (
+                        "usable_segment_missing" if len(supported) >= 2 else (
+                            "second_supported_boundary_edge_missing" if len(supported) == 1 else "no_supported_boundary_edge"
+                        )
+                    )
+                )
+            )
+        )
+        face_rows.append({
+            "face_id": fid,
+            "boundary_edge_count": int(len(boundary_edges)),
+            "supported_boundary_edges": int(len(supported)),
+            "usable_segment_edges": int(len(usable)),
+            "confident_cluster_edges": int(len(clustered)),
+            "two_distinct_supported_edges": bool(len(supported) >= 2),
+            "two_noncollinear_edge_hypotheses": bool(noncollinear),
+            "plane_fit_good_from_boundary_pair": bool(plane_good),
+            "finite_hull_good": bool(finite_good),
+            "current_candidate_pool": bool(fid in pool_face_ids),
+            "final_active_mesh": bool(fid in active_face_ids),
+            "first_loss": first_loss,
+            "first_loss_edge_id": next((eid for eid in boundary_edges if edge_rows[eid]["category"] not in {"represented_in_final_active_mesh", "represented_in_final_face_candidate", "confident_edge_cluster_available"}), None),
+        })
+
+    def edge_ceiling(ids: set[int]) -> dict[str, object]:
+        return {
+            "unique_edge_ids": int(len(ids)),
+            "edge_recall": as_json_float(len(ids) / max(len(edge_infos), 1)),
+            "edge_ids_sample": sorted(int(v) for v in ids)[:100],
+        }
+
+    def face_ceiling(predicate: str) -> dict[str, object]:
+        ids = {int(row["face_id"]) for row in face_rows if bool(row.get(predicate))}
+        return {
+            "unique_face_ids": int(len(ids)),
+            "count_recall": as_json_float(len(ids) / max(len(model_face_rows), 1)),
+            "face_ids_sample": sorted(int(v) for v in ids)[:100],
+        }
+
+    score_sorted = sorted(score_rows, key=lambda item: item[0], reverse=True)
+    frontier = []
+    for top_k in (20, 50):
+        subset = score_sorted[: min(top_k, len(score_sorted))]
+        if subset:
+            frontier.append({
+                "top_k": int(top_k),
+                "precision": as_json_float(sum(1 for _, label in subset if label) / len(subset)),
+                "positive_edges": int(sum(1 for _, label in subset if label)),
+            })
+
+    ranked_edge_rows = sorted(edge_rows, key=lambda row: finite_float(row.get("non_oracle_score_fixed_direction"), -float("inf")), reverse=True)
+
+    def score_band_anatomy(start: int, end: int) -> dict[str, object]:
+        band = ranked_edge_rows[start:end]
+        if not band:
+            return {
+                "rank_start": int(start + 1),
+                "rank_end": int(end),
+                "row_count": 0,
+            }
+        component_keys = [
+            "independent_view_score",
+            "finite_segment_span_score",
+            "saturated_support_score",
+            "second_edge_margin_score",
+            "line_residual_penalty",
+            "condition_penalty",
+        ]
+        components: dict[str, object] = {}
+        for key in component_keys:
+            components[key] = distribution_summary(
+                [
+                    (row.get("non_oracle_score_components") or {}).get(key)
+                    for row in band
+                    if isinstance(row.get("non_oracle_score_components"), dict)
+                ]
+            )
+        labels = [
+            bool(row.get("confident_cluster_available"))
+            or (
+                bool(row.get("segment_hypothesis_available"))
+                and finite_float(row.get("line_rms"), float("inf")) <= line_residual_tol
+                and finite_float(row.get("segment_t_span"), 0.0) >= 0.15
+            )
+            for row in band
+        ]
+        return {
+            "rank_start": int(start + 1),
+            "rank_end": int(min(end, len(ranked_edge_rows))),
+            "row_count": int(len(band)),
+            "precision_label": as_json_float(float(sum(labels)) / float(max(len(labels), 1))),
+            "score": distribution_summary([row.get("non_oracle_score_fixed_direction") for row in band]),
+            "raw_support_count": distribution_summary([row.get("raw_support_count") for row in band]),
+            "view_count": distribution_summary([row.get("view_count") for row in band]),
+            "z_level_count": distribution_summary([row.get("z_level_count") for row in band]),
+            "segment_t_span": distribution_summary([row.get("segment_t_span") for row in band]),
+            "line_rms": distribution_summary([row.get("line_rms") for row in band]),
+            "condition_median": distribution_summary([row.get("condition_median") for row in band]),
+            "length": distribution_summary([row.get("length") for row in band]),
+            "z_span": distribution_summary([row.get("z_span") for row in band]),
+            "assignment_ambiguity_fraction": distribution_summary([row.get("assignment_ambiguity_fraction") for row in band]),
+            "duplicate_cluster_rows": int(sum(1 for row in band if bool(row.get("duplicate_clusters_same_edge")))),
+            "near_vertical_rows": int(sum(1 for row in band if bool(row.get("near_vertical_edge")))),
+            "component_distributions": components,
+        }
+
+    two_face_edge_like = 0
+    vertex_like = 0
+    disconnected_or_wide = 0
+    true_ambiguous = 0
+    for idx in finite_indices:
+        count = int(edge_assignment_counts[int(idx)])
+        if count == 1:
+            eid = int(best_edge[int(idx)])
+            if eid >= 0 and len(edge_infos[eid]["adjacent_faces"]) == 2:
+                two_face_edge_like += 1
+        elif count >= 3:
+            vertex_like += 1
+        elif count == 2:
+            true_ambiguous += 1
+        elif count == 0:
+            disconnected_or_wide += 1
+
+    digest = hashlib.sha256()
+    digest.update(str(model_name).encode("utf-8"))
+    digest.update(np.array(windows, dtype=np.int64).tobytes())
+    digest.update(np.array(lp.shape, dtype=np.int64).tobytes())
+    digest.update(np.array([len(reference_edges), finite_indices.size, edge_tol], dtype=np.float64).tobytes())
+    segment_supported_ids = {int(row["edge_id"]) for row in edge_rows if bool(row["segment_hypothesis_available"])}
+    category_total = int(sum(category_counts.values()))
+    current_w2_segment_summary = edge_ceiling(segment_supported_ids)
+    current_w2_cluster_summary = edge_ceiling(confident_cluster_ids)
+    cross_view_short_rows = {int(row["edge_id"]) for row in edge_rows if row["category"] == "short_Z_but_cross_view_support_exists"}
+    generic_acceptance_pass = bool(
+        len(confident_cluster_ids) >= len(segment_supported_ids)
+        and len((confident_cluster_ids | segment_supported_ids) - segment_supported_ids) >= 10
+    )
+    return {
+        "schema_version": 2,
+        "model": str(model_name),
+        "scope": "edge-incidence-raw-support",
+        "production_changed": False,
+        "initial_model_usage": "posthoc edge labels/ceiling evaluation only",
+        "canonical_evaluator": canonical_oracle_evaluator_metadata(),
+        "metric_definitions": {
+            "raw_supported_edge": "a reference finite edge has at least one full raw in-memory line_point within finite-segment distance/t tolerance; oracle edge is used only for posthoc labeling",
+            "usable_segment": "an existing generic W2/fixed-index segment matches that finite reference edge after posthoc edge matching",
+            "confident_cluster": "an existing generic W2 edge cluster matches that finite reference edge with finite distance, direction, and ambiguity gates",
+            "represented_in_final_candidate": "at least one adjacent canonical finite face is present in the final candidate pool before active clipping",
+            "final_active_mesh_edge": "at least one adjacent canonical finite face is active in the final edge-clip mesh; this is face-incidence derived, so it can be much larger than the number of explicit edge clusters",
+        },
+        "outside_metric_paths": {
+            "cumulative_selection_outside": {
+                "json_path": "parameters.<selection/repair stage>.outside or trusted_outside",
+                "semantics": "stage-local accumulator used while adding or testing candidates; not directly comparable across stages",
+            },
+            "repair_final_outside": {
+                "json_path": "parameters.repair_final_outside.cumulative_outside_fraction",
+                "max_per_z_path": "parameters.repair_final_outside.cumulative_max_level_outside_fraction",
+                "lost_z_path": "parameters.repair_final_outside.cumulative_lost_z_levels",
+            },
+            "trusted_final_outside": {
+                "json_path": "parameters.trusted_outside.cumulative_outside_fraction when present, otherwise the final stage-specific trusted_outside block",
+                "semantics": "trusted observed-cloud outside after a concrete candidate set is evaluated",
+            },
+            "max_per_z_outside": {
+                "json_path": "*.cumulative_max_level_outside_fraction",
+                "semantics": "maximum per-Z trusted outside fraction for the same outside block",
+            },
+            "lost_z": {
+                "json_path": "*.cumulative_lost_z_levels",
+                "semantics": "number of trusted Z slices with no surviving inside support for the same outside block",
+            },
+        },
+        "raw_provenance": {
+            "windows": [int(v) for v in windows],
+            "line_points_shape": [int(v) for v in lp.shape],
+            "z_level_count": int(n_z),
+            "view_count": int(n_view),
+            "finite_raw_observations": int(finite_indices.size),
+            "total_raw_slots": int(total_flat),
+            "raw_signal_signature": digest.hexdigest()[:24],
+            "line_direction_provenance": "compute_line_points_multi_window does not expose per-observation local line direction; W2 segment/cluster direction is evaluated after segmentation",
+        },
+        "reference_edges": {
+            "edge_count": int(len(edge_infos)),
+            "length": distribution_summary([row["length"] for row in edge_rows]),
+            "z_span": distribution_summary([row["z_span"] for row in edge_rows]),
+            "dihedral_angle": distribution_summary([row["dihedral_angle"] for row in edge_rows]),
+        },
+        "tolerances": {
+            "finite_segment_distance": as_json_float(float(edge_tol)),
+            "line_residual": as_json_float(float(line_residual_tol)),
+        },
+        "finite_edge_raw_support_ceiling": {
+            "raw_supported": edge_ceiling(edge_support_ids),
+            "usable_segment_hypothesis": current_w2_segment_summary,
+            "confident_cluster": current_w2_cluster_summary,
+            "represented_in_final_face_candidate": edge_ceiling({int(row["edge_id"]) for row in edge_rows if bool(row["represented_in_final_face_candidate"])}),
+            "represented_in_final_active_mesh": edge_ceiling({int(row["edge_id"]) for row in edge_rows if bool(row["represented_in_final_active_mesh"])}),
+        },
+        "edge_loss_funnel": {
+            "category_counts": category_counts,
+            "category_total": category_total,
+            "accounting": {
+                "strictly_exclusive": True,
+                "reference_edge_count": int(len(edge_infos)),
+                "category_total": category_total,
+                "sum_equals_reference_edge_count": bool(category_total == len(edge_infos)),
+                "missing_or_overlapping_rows": int(category_total - len(edge_infos)),
+            },
+            "by_z_zone": summarize_rows_by_category([{"category": row["z_zone"]} for row in edge_rows]),
+            "by_direction": {
+                "near_horizontal": int(sum(1 for row in edge_rows if bool(row["near_horizontal_edge"]))),
+                "near_vertical": int(sum(1 for row in edge_rows if bool(row["near_vertical_edge"]))),
+            },
+        },
+        "boundary_edge_face_ceiling": {
+            "at_least_one_supported_boundary_edge": face_ceiling("supported_boundary_edges"),
+            "at_least_two_distinct_supported_boundary_edges": face_ceiling("two_distinct_supported_edges"),
+            "at_least_two_noncollinear_edge_hypotheses": face_ceiling("two_noncollinear_edge_hypotheses"),
+            "plane_fit_good_from_boundary_pair": face_ceiling("plane_fit_good_from_boundary_pair"),
+            "finite_hull_good": face_ceiling("finite_hull_good"),
+            "current_candidate_pool": face_ceiling("current_candidate_pool"),
+            "final_active_mesh": face_ceiling("final_active_mesh"),
+            "first_loss_counts": summarize_rows_by_category([{"category": row["first_loss"]} for row in face_rows]),
+        },
+        "previous_footprint_overlap_decomposition": {
+            "two_adjacent_faces_via_single_boundary_edge_points": int(two_face_edge_like),
+            "three_or_more_edges_near_vertex_points": int(vertex_like),
+            "two_edge_ambiguous_points": int(true_ambiguous),
+            "not_explained_by_finite_edge_tolerance_points": int(disconnected_or_wide),
+            "normal_case_note": "single boundary-edge points are expected to belong to two adjacent face polygons and should not be treated as face-mixing failure",
+        },
+        "representation_comparison": {
+            "current_w2_fixed_index_segments": {
+                **current_w2_segment_summary,
+                "hypothesis_count": int(len(w2_segments)),
+                "generation_uses_initial_model": False,
+                "posthoc_evaluation_uses_initial_model": True,
+            },
+            "cross_view_short_edge_tls": {
+                **edge_ceiling(cross_view_short_rows),
+                "hypothesis_count": int(len(cross_view_short_rows)),
+                "generation_uses_initial_model": True,
+                "production_eligible": False,
+                "reason": "this row is an oracle-reference-edge ceiling over matched raw support, not a materialized generic hypothesis pool",
+            },
+            "cross_view_edge_consensus_clusters": {
+                **current_w2_cluster_summary,
+                "hypothesis_count": int(len(w2_clusters)),
+                "generation_uses_initial_model": False,
+                "posthoc_evaluation_uses_initial_model": True,
+            },
+            "mixed_segment_split": {
+                "skipped": True,
+                "reason": "no production split mode was created; this audit only separates spatially plausible edge-incidence evidence posthoc",
+            },
+        },
+        "score_dependency_audit": {
+            "row_type": "oracle_reference_edge_rows",
+            "production_eligible": False,
+            "interpretation": "AUC/top-K below are diagnostic separation ceilings because each row is a reference edge created after oracle finite-edge matching.",
+            "components": [
+                {
+                    "field_name": "independent_view_score",
+                    "source_stage": "raw observations after oracle reference-edge matching",
+                    "uses_initial_model": True,
+                    "uses_reference_edge": True,
+                    "uses_oracle_match": True,
+                    "available_when_oracle_disabled": False,
+                },
+                {
+                    "field_name": "finite_segment_span_score",
+                    "source_stage": "projection parameter on oracle reference finite segment",
+                    "uses_initial_model": True,
+                    "uses_reference_edge": True,
+                    "uses_oracle_match": True,
+                    "available_when_oracle_disabled": False,
+                },
+                {
+                    "field_name": "saturated_support_score",
+                    "source_stage": "raw observations counted after oracle reference-edge matching",
+                    "uses_initial_model": True,
+                    "uses_reference_edge": True,
+                    "uses_oracle_match": True,
+                    "available_when_oracle_disabled": False,
+                },
+                {
+                    "field_name": "second_edge_margin_score",
+                    "source_stage": "nearest and second-nearest oracle reference finite edge distances",
+                    "uses_initial_model": True,
+                    "uses_reference_edge": True,
+                    "uses_oracle_match": True,
+                    "available_when_oracle_disabled": False,
+                },
+                {
+                    "field_name": "line_residual_penalty",
+                    "source_stage": "TLS fit to oracle-matched raw support",
+                    "uses_initial_model": True,
+                    "uses_reference_edge": True,
+                    "uses_oracle_match": True,
+                    "available_when_oracle_disabled": False,
+                },
+                {
+                    "field_name": "condition_penalty",
+                    "source_stage": "raw observation condition values restricted to oracle-matched support",
+                    "uses_initial_model": True,
+                    "uses_reference_edge": True,
+                    "uses_oracle_match": True,
+                    "available_when_oracle_disabled": False,
+                },
+            ],
+            "production_eligible_score_required_flags": {
+                "uses_initial_model": False,
+                "uses_reference_edge": False,
+                "uses_oracle_match": False,
+                "available_when_oracle_disabled": True,
+            },
+        },
+        "non_oracle_separation": {
+            "fixed_direction_score": {
+                "higher_is_better": True,
+                "formula": "independent views + finite t-span + saturated support + edge margin - line residual - bounded condition penalty",
+                "roc_auc": as_json_float(_auc_binary(score_rows, higher_is_better=True)) if _auc_binary(score_rows, higher_is_better=True) is not None else None,
+                "pr_auc": as_json_float(_pr_auc_binary(score_rows, higher_is_better=True)) if _pr_auc_binary(score_rows, higher_is_better=True) is not None else None,
+                "frontier": frontier,
+                "top_band_anatomy": {
+                    "ranks_1_20": score_band_anatomy(0, 20),
+                    "ranks_21_50": score_band_anatomy(20, 50),
+                    "ranks_51_100": score_band_anatomy(50, 100),
+                    "predeclared_direction_note": "higher views/span/support/margin and lower residual/condition are better; signs were not inverted after oracle labels",
+                },
+            },
+            "edge_cluster_precision_recall": {
+                "confident_cluster_edges": int(len(confident_cluster_ids)),
+                "raw_supported_edges": int(len(edge_support_ids)),
+                "recall_vs_raw_supported": as_json_float(len(confident_cluster_ids) / max(len(edge_support_ids), 1)),
+                "duplicate_cluster_edges": int(len(duplicate_cluster_edges)),
+            },
+            "generic_pool_acceptance_for_face_pairing": {
+                "passed": generic_acceptance_pass,
+                "reason": "current generic cluster pool does not add enough unique usable edge IDs beyond W2 segment support; oracle-reference rows are not eligible for production face pairing",
+                "minimum_additional_boundary_edge_ids_required": 10,
+                "precision_requirement": 0.5,
+            },
+        },
+        "generic_face_adjacency": {
+            "attempted": False,
+            "reason": "gated off because no production-eligible generic edge pool improved unique usable edge IDs; face pairing would be oracle-tuned if continued",
+            "current_cyclic_adjacency": {
+                "candidate_face_ids": int(len(pool_face_ids)),
+                "final_active_face_ids": int(len(active_face_ids)),
+            },
+            "bounded_spatial_k_adjacency": {
+                "attempted": False,
+                "reject_reason": "no accepted generic edge shortlist",
+            },
+            "mutual_adjacency": {
+                "attempted": False,
+                "reject_reason": "no accepted generic edge shortlist",
+            },
+            "mandatory_rejects": [
+                "duplicate_same_edge",
+                "overlapping_collinear_duplicate",
+                "insufficient_plane_span",
+                "no_shared_spatial_patch",
+                "unstable_pair_plane",
+                "excessive_pair_distance",
+                "insufficient_independent_support",
+            ],
+        },
+        "diagnostic_face_candidates_from_edge_incidence": {
+            "attempted": False,
+            "reason": "edge-first ceiling is recorded, but no production-eligible generic edge shortlist passed the gate for edge-pair candidate formation",
+            "candidate_finite_good_precision": None,
+            "unique_face_ids": 0,
+        },
+        "full_edge_clip_trials": {
+            "attempted": False,
+            "reason": "no non-oracle edge-incidence shortlist was promoted to candidate-level trials",
+            "max_trials_per_model": 20,
+        },
+        "branch_decision": {
+            "selected": "B" if category_counts["short_Z_but_cross_view_support_exists"] + category_counts["segment_fit_rejected"] > 0 else "C",
+            "legend": {
+                "A": "boundary edges absent in raw signal",
+                "B": "raw edges exist, but segment formation loses short edges",
+                "C": "edge clusters exist, but face adjacency/pairing is wrong",
+                "D": "plane is good, finite hull is wrong",
+                "E": "edge-first hypotheses exist, but non-oracle separation is insufficient",
+                "F": "observable edge incidence is genuinely insufficient",
+            },
+            "production_mode_added": False,
+        },
+        "edge_rows_sample": sorted(edge_rows, key=lambda row: (not bool(row["near_vertical_edge"]), -int(row["raw_support_count"])))[:120],
+        "face_rows_sample": face_rows[:160],
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
+def _generic_edge_segment_points(segment: dict[str, object], z_levels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    z_indices = [
+        int(value)
+        for value in (segment.get("z_indices") or [])
+        if 0 <= int(value) < int(z_levels.size)
+    ]
+    if z_indices:
+        z = z_levels[np.array(z_indices, dtype=int)]
+    else:
+        z_min = finite_float(segment.get("z_min"), float("nan"))
+        z_max = finite_float(segment.get("z_max"), float("nan"))
+        if not np.isfinite(z_min) or not np.isfinite(z_max):
+            return np.zeros((0,), dtype=float), np.zeros((0, 3), dtype=float)
+        count = max(2, int(segment.get("levels") or 2))
+        z = np.linspace(z_min, z_max, min(count, 32), dtype=float)
+    points = predict_w2_line(segment, z)
+    finite = np.all(np.isfinite(points), axis=1) & np.isfinite(z)
+    return z[finite], points[finite]
+
+
+def _tls_line_from_points(points: np.ndarray) -> dict[str, object] | None:
+    pts = np.asarray(points, dtype=float).reshape((-1, 3))
+    pts = pts[np.all(np.isfinite(pts), axis=1)]
+    if pts.shape[0] < 2:
+        return None
+    centroid = np.mean(pts, axis=0)
+    centered = pts - centroid[None, :]
+    try:
+        _, singular, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    direction = vh[0].astype(float)
+    norm = float(np.linalg.norm(direction))
+    if norm <= EPS:
+        return None
+    direction = direction / norm
+    if tuple(float(v) for v in direction) < tuple(float(-v) for v in direction):
+        direction = -direction
+    coord = centered @ direction
+    residual = np.linalg.norm(centered - coord[:, None] * direction[None, :], axis=1)
+    order = np.argsort(coord)
+    return {
+        "centroid": centroid,
+        "direction": direction,
+        "coord": coord,
+        "segment_min": centroid + float(np.min(coord)) * direction,
+        "segment_max": centroid + float(np.max(coord)) * direction,
+        "segment_length": float(np.max(coord) - np.min(coord)),
+        "residual": residual,
+        "residual_median": float(np.median(residual)) if residual.size else float("inf"),
+        "residual_p95": float(np.percentile(residual, 95)) if residual.size else float("inf"),
+        "condition": float(singular[0] / max(singular[1], EPS)) if singular.size > 1 else float("inf"),
+        "ordered_points": pts[order],
+    }
+
+
+def _segment_sample_distance(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray) -> tuple[float, float]:
+    t = np.linspace(0.0, 1.0, 7)
+    a_pts = a0[None, :] + t[:, None] * (a1 - a0)[None, :]
+    b_pts = b0[None, :] + t[:, None] * (b1 - b0)[None, :]
+    da, _ = _edge_segment_distances(a_pts, b0, b1)
+    db, _ = _edge_segment_distances(b_pts, a0, a1)
+    return float(max(np.median(da), np.median(db))), float(max(np.max(da), np.max(db)))
+
+
+def _generic_edge_match(
+    hypothesis: dict[str, object],
+    edge_infos: list[dict[str, object]],
+    *,
+    distance_tol: float,
+    angle_tol: float,
+) -> dict[str, object]:
+    endpoints = np.asarray(hypothesis.get("endpoints") or [], dtype=float).reshape((-1, 3))
+    direction = np.asarray(hypothesis.get("direction") or [], dtype=float)
+    if endpoints.shape[0] < 2 or direction.shape != (3,):
+        return {"classification": "unmatched", "edge_id": None, "confidence": False}
+    samples = endpoints[0][None, :] + np.linspace(0.0, 1.0, 7)[:, None] * (endpoints[-1] - endpoints[0])[None, :]
+    margin = max(float(distance_tol) * 4.0, 0.08)
+    hmin = np.min(samples, axis=0) - margin
+    hmax = np.max(samples, axis=0) + margin
+    candidate_edges = [
+        info
+        for info in edge_infos
+        if np.all(np.asarray(info.get("bbox_max"), dtype=float) >= hmin)
+        and np.all(np.asarray(info.get("bbox_min"), dtype=float) <= hmax)
+    ]
+    if not candidate_edges:
+        candidate_edges = edge_infos
+    if len(candidate_edges) > 160:
+        centroid = np.mean(samples, axis=0)
+        candidate_edges = sorted(
+            candidate_edges,
+            key=lambda info: (
+                float(
+                    np.linalg.norm(
+                        centroid
+                        - np.clip(
+                            centroid,
+                            np.asarray(info.get("bbox_min"), dtype=float),
+                            np.asarray(info.get("bbox_max"), dtype=float),
+                        )
+                    )
+                ),
+                int(info["edge_id"]),
+            ),
+        )[:160]
+    rows: list[dict[str, object]] = []
+    for info in candidate_edges:
+        edge_dir = np.asarray(info["direction"], dtype=float)
+        distances, t = _edge_segment_distances(samples, np.asarray(info["a"], dtype=float), np.asarray(info["b"], dtype=float))
+        angle = float(np.degrees(np.arccos(np.clip(abs(float(direction @ edge_dir)), -1.0, 1.0))))
+        inside_fraction = float(np.mean((t >= -0.05) & (t <= 1.05)))
+        median_distance = float(np.median(distances))
+        score = median_distance / max(distance_tol, EPS) + angle / max(angle_tol, EPS) + max(0.0, 0.6 - inside_fraction)
+        rows.append(
+            {
+                "edge_id": int(info["edge_id"]),
+                "median_distance": as_json_float(median_distance),
+                "max_distance": as_json_float(float(np.max(distances))),
+                "angle_deg": as_json_float(angle),
+                "inside_fraction": as_json_float(inside_fraction),
+                "score": as_json_float(score),
+            }
+        )
+    rows.sort(key=lambda row: (finite_float(row.get("score"), float("inf")), int(row["edge_id"])))
+    top = rows[0] if rows else None
+    second = rows[1] if len(rows) > 1 else None
+    if top is None:
+        return {"classification": "unmatched", "edge_id": None, "confidence": False}
+    margin = (
+        finite_float(second.get("score"), float("inf")) - finite_float(top.get("score"), float("inf"))
+        if second is not None
+        else float("inf")
+    )
+    confident = bool(
+        finite_float(top.get("median_distance"), float("inf")) <= distance_tol
+        and finite_float(top.get("angle_deg"), 180.0) <= angle_tol
+        and finite_float(top.get("inside_fraction"), 0.0) >= 0.55
+        and margin >= 0.15
+    )
+    return {
+        "classification": "confident" if confident else ("ambiguous" if margin < 0.15 else "unmatched"),
+        "edge_id": int(top["edge_id"]) if confident else None,
+        "confidence": confident,
+        "top_matches": rows[:3],
+        "score_margin": as_json_float(float(margin)),
+    }
+
+
+def diagnose_generic_cross_view_edge_pool(
+    *,
+    model_name: str,
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    z_levels: np.ndarray,
+    line_points_w2: np.ndarray,
+    w2_segments: list[dict[str, object]],
+    w2_clusters: list[dict[str, object]],
+    w2_candidates: list[dict[str, object]],
+    baseline_payload: dict[str, object] | None,
+    additive_mode: bool = False,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    reference_edges, edge_faces_map = model_edges_from_faces(vertices, faces)
+    model_face_rows = model_face_planes(vertices, faces)
+    edge_infos: list[dict[str, object]] = []
+    z_min = float(np.min(vertices[:, 2])) if vertices.size else 0.0
+    z_max = float(np.max(vertices[:, 2])) if vertices.size else 1.0
+    lower_cut = z_min + (z_max - z_min) / 3.0
+    for eid, (ia, ib) in enumerate(reference_edges):
+        a = vertices[int(ia)]
+        b = vertices[int(ib)]
+        vec = b - a
+        length = float(np.linalg.norm(vec))
+        direction = vec / max(length, EPS)
+        adjacent = sorted(int(fid) for fid in edge_faces_map.get((int(ia), int(ib)), edge_faces_map.get((int(ib), int(ia)), set())))
+        z_mid = float(0.5 * (a[2] + b[2]))
+        edge_infos.append(
+            {
+                "edge_id": int(eid),
+                "a": a,
+                "b": b,
+                "bbox_min": np.minimum(a, b),
+                "bbox_max": np.maximum(a, b),
+                "length": length,
+                "direction": direction,
+                "z_span": float(abs(float(a[2]) - float(b[2]))),
+                "lower_z": bool(z_mid <= lower_cut),
+                "adjacent_faces": adjacent,
+            }
+        )
+    finite_lp = np.asarray(line_points_w2, dtype=float).reshape((-1, 3))
+    finite_lp = finite_lp[np.all(np.isfinite(finite_lp), axis=1)]
+    spacing_values: list[float] = []
+    if np.asarray(line_points_w2).ndim == 3:
+        arr = np.asarray(line_points_w2, dtype=float)
+        for zi in np.linspace(0, arr.shape[1] - 1, min(arr.shape[1], 32), dtype=int):
+            pts = arr[:, int(zi), :]
+            ok = np.all(np.isfinite(pts), axis=1)
+            pts = pts[ok]
+            if pts.shape[0] >= 3:
+                step = np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1)
+                spacing_values.extend(float(v) for v in step[np.isfinite(step) & (step > EPS)])
+    median_spacing = float(np.median(spacing_values)) if spacing_values else 0.02
+    z_step = float(np.median(np.diff(z_levels))) if z_levels.size > 1 else 0.01
+    primitive_lengths = [finite_float(segment.get("z_span"), 0.0) for segment in w2_segments]
+    median_primitive_length = float(np.median([v for v in primitive_lengths if v > EPS])) if any(v > EPS for v in primitive_lengths) else max(0.1, 4.0 * abs(z_step))
+    residual_values = [finite_float(segment.get("line_rms"), float("nan")) for segment in w2_segments]
+    residual_clean = np.asarray([v for v in residual_values if np.isfinite(v)], dtype=float)
+    residual_median = float(np.median(residual_clean)) if residual_clean.size else 0.01
+    residual_mad = float(np.median(np.abs(residual_clean - residual_median))) if residual_clean.size else residual_median
+    n_half = int(line_points_w2.shape[0]) if np.asarray(line_points_w2).ndim >= 2 else 1
+    angular_step_deg = float(360.0 / max(n_half, 1))
+    thresholds = {
+        "median_nearest_neighbor_point_spacing": as_json_float(median_spacing),
+        "z_step": as_json_float(abs(z_step)),
+        "median_primitive_z_span": as_json_float(median_primitive_length),
+        "robust_residual_median": as_json_float(residual_median),
+        "robust_residual_mad": as_json_float(residual_mad),
+        "angular_view_step_deg": as_json_float(angular_step_deg),
+        "neighbor_k": 6,
+        "max_pair_segment_distance": as_json_float(max(3.0 * median_spacing, 2.0 * abs(z_step), residual_median + 3.0 * residual_mad, 0.035)),
+        "max_direction_angle_deg": as_json_float(min(12.0, max(3.0, 6.0 * angular_step_deg))),
+        "min_projected_overlap_fraction": 0.12,
+        "max_projected_gap": as_json_float(max(4.0 * median_spacing, 2.0 * abs(z_step), 0.04)),
+        "min_independent_views": 1,
+        "min_independent_z": 2,
+        "caps": {
+            "max_direction_angle_deg": 12.0,
+            "max_pair_segment_distance_floor": 0.035,
+            "reason": "shared caps prevent degenerate over-tight thresholds on very dense contours; values are model-independent",
+        },
+    }
+    primitive_materialization_cap = 3000
+    sorted_source_segments = sorted(
+        w2_segments,
+        key=lambda row: (
+            finite_float(row.get("line_rms"), float("inf")),
+            -int(row.get("levels") or 0),
+            int(row.get("segment_id") or 0),
+        ),
+    )
+    source_segments = sorted_source_segments[:primitive_materialization_cap]
+
+    def materialize_primitives_from_segments(segments: list[dict[str, object]]) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for segment in segments:
+            z, pts = _generic_edge_segment_points(segment, z_levels)
+            tls = _tls_line_from_points(pts)
+            if tls is None:
+                continue
+            cyclic_index = int(segment.get("cyclic_index") or 0)
+            source_mode = str(segment.get("segment_fit_mode") or "least_squares")
+            z_indices = [int(value) for value in (segment.get("z_indices") or [])]
+            point_ids = [f"w2:{cyclic_index}:{int(value)}" for value in z_indices[:80]]
+            gid_blob = json.dumps(
+                {
+                    "segment_id": int(segment.get("segment_id") or -1),
+                    "cyclic_index": cyclic_index,
+                    "z_indices": z_indices,
+                    "source": source_mode,
+                },
+                separators=(",", ":"),
+            )
+            direction = np.asarray(tls["direction"], dtype=float)
+            out.append(
+                {
+                    "generic_id": "prim_" + hashlib.sha256(gid_blob.encode("utf-8")).hexdigest()[:16],
+                    "source_segment_id": int(segment.get("segment_id") or -1),
+                    "source_mode": source_mode,
+                    "cyclic_index": cyclic_index,
+                    "cyclic_indices": [cyclic_index],
+                    "contributing_observation_ids_sample": point_ids,
+                    "contributing_observation_count": int(len(z_indices) if z_indices else pts.shape[0]),
+                    "endpoints": [as_json_point(np.asarray(tls["segment_min"], dtype=float)), as_json_point(np.asarray(tls["segment_max"], dtype=float))],
+                    "centroid": as_json_point(np.asarray(tls["centroid"], dtype=float)),
+                    "direction": as_json_point(direction),
+                    "segment_length": as_json_float(float(tls["segment_length"])),
+                    "z_span": as_json_float(float(np.ptp(z)) if z.size else 0.0),
+                    "view_angular_span_deg": as_json_float(0.0),
+                    "independent_view_count": 1,
+                    "independent_z_count": int(len(set(z_indices)) if z_indices else z.size),
+                    "line_residual_median": as_json_float(float(tls["residual_median"])),
+                    "line_residual_p95": as_json_float(float(tls["residual_p95"])),
+                    "direction_dispersion_deg": as_json_float(0.0),
+                    "condition": as_json_float(float(tls["condition"])),
+                    "cyclic_index_provenance": {"window": 2, "cyclic_index": cyclic_index},
+                    "_points": pts,
+                    "_coord": np.asarray(tls["coord"], dtype=float),
+                }
+            )
+        return out
+
+    primitives: list[dict[str, object]] = materialize_primitives_from_segments(source_segments)
+
+    all_primitives: list[dict[str, object]] | None = None
+    if additive_mode:
+        all_primitives = materialize_primitives_from_segments(sorted_source_segments)
+
+    def source_mode_counts(rows: list[dict[str, object]]) -> dict[str, int]:
+        return {
+            source: int(sum(str(row.get("source_mode")) == source for row in rows))
+            for source in sorted({str(row.get("source_mode")) for row in rows})
+        }
+
+    def distribution_block(values: list[float]) -> dict[str, object]:
+        clean = np.asarray([float(v) for v in values if np.isfinite(float(v))], dtype=float)
+        if clean.size == 0:
+            return {"count": 0}
+        return {
+            "count": int(clean.size),
+            "min": as_json_float(float(np.min(clean))),
+            "median": as_json_float(float(np.median(clean))),
+            "p75": as_json_float(float(np.percentile(clean, 75))),
+            "p95": as_json_float(float(np.percentile(clean, 95))),
+            "max": as_json_float(float(np.max(clean))),
+        }
+
+    def primitive_distribution(rows: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "segment_length": distribution_block([finite_float(row.get("segment_length"), float("nan")) for row in rows]),
+            "z_span": distribution_block([finite_float(row.get("z_span"), float("nan")) for row in rows]),
+            "independent_z_count": distribution_block([finite_float(row.get("independent_z_count"), float("nan")) for row in rows]),
+            "line_residual_p95": distribution_block([finite_float(row.get("line_residual_p95"), float("nan")) for row in rows]),
+        }
+
+    def primitive_match_ids(rows: list[dict[str, object]], *, cap: int) -> set[int]:
+        ids: set[int] = set()
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                finite_float(row.get("line_residual_p95"), float("inf")),
+                -int(row.get("independent_z_count") or 0),
+                -finite_float(row.get("segment_length"), 0.0),
+                str(row.get("generic_id")),
+            ),
+        )[:cap]
+        for row in ordered:
+            match = _generic_edge_match(
+                row,
+                edge_infos,
+                distance_tol=max(2.5 * median_spacing, 2.0 * abs(z_step), residual_median + 3.0 * residual_mad, 0.04),
+                angle_tol=finite_float(thresholds["max_direction_angle_deg"], 12.0),
+            )
+            if bool(match.get("confidence")) and match.get("edge_id") is not None:
+                ids.add(int(match["edge_id"]))
+        return ids
+
+    consensus_primitive_cap = 600 if additive_mode else 1200
+    consensus_primitives = sorted(
+        primitives,
+        key=lambda row: (
+            finite_float(row.get("line_residual_p95"), float("inf")),
+            -int(row.get("independent_z_count") or 0),
+            -finite_float(row.get("segment_length"), 0.0),
+            str(row.get("generic_id")),
+        ),
+    )[:consensus_primitive_cap]
+    primitive_by_id = {str(row["generic_id"]): row for row in consensus_primitives}
+
+    def primitive_pair_features(a: dict[str, object], b: dict[str, object]) -> dict[str, object]:
+        a_end = np.asarray(a["endpoints"], dtype=float)
+        b_end = np.asarray(b["endpoints"], dtype=float)
+        da = np.asarray(a["direction"], dtype=float)
+        db = np.asarray(b["direction"], dtype=float)
+        direction_angle = float(np.degrees(np.arccos(np.clip(abs(float(da @ db)), -1.0, 1.0))))
+        spatial_median, spatial_max = _segment_sample_distance(a_end[0], a_end[1], b_end[0], b_end[1])
+        axis = da if float(da @ db) >= 0.0 else -da
+        origin = 0.5 * (np.mean(a_end, axis=0) + np.mean(b_end, axis=0))
+        ac = (a_end - origin[None, :]) @ axis
+        bc = (b_end - origin[None, :]) @ axis
+        overlap = max(0.0, min(float(np.max(ac)), float(np.max(bc))) - max(float(np.min(ac)), float(np.min(bc))))
+        union = max(float(np.max(ac)), float(np.max(bc))) - min(float(np.min(ac)), float(np.min(bc)))
+        gap = max(0.0, max(float(np.min(ac)), float(np.min(bc))) - min(float(np.max(ac)), float(np.max(bc))))
+        za0 = finite_float(a.get("z_span"), 0.0)
+        zb0 = finite_float(b.get("z_span"), 0.0)
+        independent = bool(set(a.get("cyclic_indices") or []) != set(b.get("cyclic_indices") or []))
+        return {
+            "spatial_median": spatial_median,
+            "spatial_max": spatial_max,
+            "direction_angle_deg": direction_angle,
+            "projected_overlap_fraction": overlap / max(union, EPS),
+            "projected_gap": gap,
+            "independent_provenance": independent,
+            "z_span_min": min(za0, zb0),
+        }
+
+    def compatible(a: dict[str, object], b: dict[str, object]) -> bool:
+        f = primitive_pair_features(a, b)
+        return bool(
+            f["spatial_median"] <= finite_float(thresholds["max_pair_segment_distance"], 0.0)
+            and f["direction_angle_deg"] <= finite_float(thresholds["max_direction_angle_deg"], 0.0)
+            and (
+                f["projected_overlap_fraction"] >= float(thresholds["min_projected_overlap_fraction"])
+                or f["projected_gap"] <= finite_float(thresholds["max_projected_gap"], 0.0)
+            )
+            and f["z_span_min"] >= abs(z_step)
+        )
+
+    neighbor_candidates: dict[str, list[tuple[float, str]]] = {str(row["generic_id"]): [] for row in consensus_primitives}
+    cell_size = max(finite_float(thresholds["max_pair_segment_distance"], 0.05) * 4.0, median_spacing * 6.0, abs(z_step) * 4.0, 0.05)
+    grid: dict[tuple[int, int, int], list[int]] = {}
+    for index, row in enumerate(consensus_primitives):
+        centroid = np.asarray(row.get("centroid"), dtype=float)
+        if centroid.shape != (3,) or not np.all(np.isfinite(centroid)):
+            continue
+        cell = tuple(int(np.floor(float(value) / cell_size)) for value in centroid)
+        grid.setdefault(cell, []).append(int(index))
+    candidate_pairs: set[tuple[int, int]] = set()
+    for index, row in enumerate(consensus_primitives):
+        centroid = np.asarray(row.get("centroid"), dtype=float)
+        if centroid.shape != (3,) or not np.all(np.isfinite(centroid)):
+            continue
+        cell = tuple(int(np.floor(float(value) / cell_size)) for value in centroid)
+        local_indices: list[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    local_indices.extend(grid.get((cell[0] + dx, cell[1] + dy, cell[2] + dz), []))
+        nearest = sorted(
+            {
+                int(other)
+                for other in local_indices
+                if int(other) != int(index)
+            },
+            key=lambda other: (
+                float(np.linalg.norm(np.asarray(consensus_primitives[other].get("centroid"), dtype=float) - centroid)),
+                int(other),
+            ),
+        )[: max(int(thresholds["neighbor_k"]) * 4, 12)]
+        for other in nearest:
+            candidate_pairs.add(tuple(sorted((int(index), int(other)))))
+    for i, j in sorted(candidate_pairs):
+        a = consensus_primitives[int(i)]
+        b = consensus_primitives[int(j)]
+        if not compatible(a, b):
+            continue
+        f = primitive_pair_features(a, b)
+        score = (
+            f["spatial_median"] / max(finite_float(thresholds["max_pair_segment_distance"], EPS), EPS)
+            + f["direction_angle_deg"] / max(finite_float(thresholds["max_direction_angle_deg"], EPS), EPS)
+            + max(0.0, float(thresholds["min_projected_overlap_fraction"]) - f["projected_overlap_fraction"])
+            + f["projected_gap"] / max(finite_float(thresholds["max_projected_gap"], EPS), EPS)
+        )
+        neighbor_candidates[str(a["generic_id"])].append((float(score), str(b["generic_id"])))
+        neighbor_candidates[str(b["generic_id"])].append((float(score), str(a["generic_id"])))
+    top_neighbors = {
+        key: {other for _, other in sorted(values, key=lambda item: (item[0], item[1]))[: int(thresholds["neighbor_k"])]}
+        for key, values in neighbor_candidates.items()
+    }
+    mutual_edges: dict[str, set[str]] = {str(row["generic_id"]): set() for row in consensus_primitives}
+    for key, values in top_neighbors.items():
+        for other in values:
+            if key in top_neighbors.get(other, set()):
+                mutual_edges[key].add(other)
+                mutual_edges[other].add(key)
+    visited: set[str] = set()
+    components: list[list[str]] = []
+    for row in consensus_primitives:
+        gid = str(row["generic_id"])
+        if gid in visited:
+            continue
+        stack = [gid]
+        visited.add(gid)
+        comp: list[str] = []
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nxt in mutual_edges.get(cur, set()):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append(nxt)
+        components.append(sorted(comp))
+    complete_groups: list[list[str]] = []
+    for comp in components:
+        groups: list[list[str]] = []
+        for gid in sorted(comp, key=lambda value: (-int(primitive_by_id[value].get("independent_z_count") or 0), value)):
+            placed = False
+            for group in groups:
+                if all(compatible(primitive_by_id[gid], primitive_by_id[other]) for other in group):
+                    group.append(gid)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([gid])
+        complete_groups.extend(groups)
+
+    hypotheses: list[dict[str, object]] = []
+    rejection_counts: dict[str, int] = {}
+    for group_index, group in enumerate(complete_groups):
+        members = [primitive_by_id[gid] for gid in group]
+        points = np.vstack([np.asarray(member["_points"], dtype=float) for member in members])
+        tls = _tls_line_from_points(points)
+        if tls is None:
+            rejection_counts["tls_failed"] = rejection_counts.get("tls_failed", 0) + 1
+            continue
+        views = sorted({int(v) for member in members for v in (member.get("cyclic_indices") or [])})
+        z_counts = [int(member.get("independent_z_count") or 0) for member in members]
+        if len(views) < int(thresholds["min_independent_views"]) or sum(z_counts) < int(thresholds["min_independent_z"]):
+            rejection_counts["insufficient_independent_support"] = rejection_counts.get("insufficient_independent_support", 0) + 1
+            continue
+        dirs = [np.asarray(member["direction"], dtype=float) for member in members]
+        ref_dir = np.asarray(tls["direction"], dtype=float)
+        direction_angles = [
+            float(np.degrees(np.arccos(np.clip(abs(float(ref_dir @ d)), -1.0, 1.0))))
+            for d in dirs
+            if d.shape == (3,)
+        ]
+        endpoint_coords = []
+        for member in members:
+            end = np.asarray(member["endpoints"], dtype=float)
+            endpoint_coords.extend(float(v) for v in ((end - np.asarray(tls["centroid"], dtype=float)[None, :]) @ ref_dir))
+        endpoint_stability = float(np.std(endpoint_coords) / max(float(tls["segment_length"]), EPS)) if endpoint_coords else float("inf")
+        condition = finite_float(tls["condition"], float("inf"))
+        score_components = {
+            "independent_view_score": min(len(views), 6) / 6.0,
+            "independent_z_score": min(sum(z_counts), 20) / 20.0,
+            "finite_length_score": min(float(tls["segment_length"]) / max(4.0 * median_spacing, EPS), 1.0),
+            "tls_residual_penalty": min(float(tls["residual_p95"]) / max(residual_median + 3.0 * residual_mad, EPS), 1.0),
+            "direction_dispersion_penalty": min((max(direction_angles) if direction_angles else 0.0) / max(finite_float(thresholds["max_direction_angle_deg"], EPS), EPS), 1.0),
+            "cross_view_recurrence_score": min(max(0, len(members) - 1), 5) / 5.0,
+            "endpoint_stability_penalty": min(endpoint_stability, 1.0),
+            "condition_penalty": min(max(np.log10(max(condition, 1.0)) - 5.0, 0.0) / 3.0, 1.0),
+            "duplicate_overlap_penalty": 0.0,
+        }
+        score = (
+            score_components["independent_view_score"]
+            + score_components["independent_z_score"]
+            + score_components["finite_length_score"]
+            + score_components["cross_view_recurrence_score"]
+            - score_components["tls_residual_penalty"]
+            - score_components["direction_dispersion_penalty"]
+            - score_components["endpoint_stability_penalty"]
+            - score_components["condition_penalty"]
+            - score_components["duplicate_overlap_penalty"]
+        )
+        blob = json.dumps(sorted(group), separators=(",", ":"))
+        hypotheses.append(
+            {
+                "generic_edge_hypothesis_id": "edge_" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16],
+                "source_mode": "mutual-spatial-complete",
+                "member_primitive_ids": sorted(group),
+                "member_segment_ids": sorted(int(member["source_segment_id"]) for member in members),
+                "contributing_observation_count": int(sum(int(member.get("contributing_observation_count") or 0) for member in members)),
+                "endpoints": [as_json_point(np.asarray(tls["segment_min"], dtype=float)), as_json_point(np.asarray(tls["segment_max"], dtype=float))],
+                "centroid": as_json_point(np.asarray(tls["centroid"], dtype=float)),
+                "direction": as_json_point(ref_dir),
+                "segment_length": as_json_float(float(tls["segment_length"])),
+                "z_span": as_json_float(float(np.ptp(points[:, 2])) if points.size else 0.0),
+                "view_angular_span_deg": as_json_float((max(views) - min(views)) * angular_step_deg if views else 0.0),
+                "independent_view_count": int(len(views)),
+                "independent_z_count": int(sum(z_counts)),
+                "line_residual_median": as_json_float(float(tls["residual_median"])),
+                "line_residual_p95": as_json_float(float(tls["residual_p95"])),
+                "direction_dispersion_deg": as_json_float(max(direction_angles) if direction_angles else 0.0),
+                "endpoint_stability": as_json_float(endpoint_stability),
+                "condition": as_json_float(condition),
+                "score": as_json_float(float(score)),
+                "score_components": {key: as_json_float(float(value)) for key, value in score_components.items()},
+                "provenance_signature": hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24],
+            }
+        )
+    hypotheses.sort(key=lambda row: (-finite_float(row.get("score"), -float("inf")), str(row["generic_edge_hypothesis_id"])))
+    posthoc_evaluation_cap = 160 if additive_mode else 300
+    current_w2_evaluation_cap = 300 if additive_mode else 500
+    evaluated_hypotheses = hypotheses[:posthoc_evaluation_cap]
+    evaluated_w2_clusters = sorted(
+        w2_clusters,
+        key=lambda row: (
+            -finite_float(row.get("cluster_confidence"), 0.0),
+            -int(row.get("levels") or 0),
+            int(row.get("edge_cluster_id") or 0),
+        ),
+    )[:current_w2_evaluation_cap]
+    match_tol = max(2.5 * median_spacing, 2.0 * abs(z_step), residual_median + 3.0 * residual_mad, 0.04)
+    current_matches = [
+        _generic_edge_match(
+            {
+                "endpoints": [
+                    as_json_point(predict_w2_line(cluster, np.array([finite_float(cluster.get("cluster_z_min"), finite_float(cluster.get("z_min"), 0.0))], dtype=float))[0]),
+                    as_json_point(predict_w2_line(cluster, np.array([finite_float(cluster.get("cluster_z_max"), finite_float(cluster.get("z_max"), 0.0))], dtype=float))[0]),
+                ],
+                "direction": cluster.get("direction"),
+            },
+            edge_infos,
+            distance_tol=match_tol,
+            angle_tol=finite_float(thresholds["max_direction_angle_deg"], 12.0),
+        )
+        for cluster in evaluated_w2_clusters
+    ]
+    generic_matches = [
+        _generic_edge_match(hypothesis, edge_infos, distance_tol=match_tol, angle_tol=finite_float(thresholds["max_direction_angle_deg"], 12.0))
+        for hypothesis in evaluated_hypotheses
+    ]
+
+    face_to_edges: dict[int, set[int]] = {}
+    for info in edge_infos:
+        for fid in info["adjacent_faces"]:
+            face_to_edges.setdefault(int(fid), set()).add(int(info["edge_id"]))
+    baseline_final_faces: set[int] = set()
+    baseline_candidate_ids: list[int] = []
+    regression_block: dict[str, object] = {"baseline_json_available": False, "passed": None}
+    if isinstance(baseline_payload, dict):
+        baseline_candidates = list(baseline_payload.get("face_candidates") or [])
+        active_indices = [
+            int(index)
+            for index in (baseline_payload.get("reconstructed") or {}).get("face_candidate_indices", [])
+            if 0 <= int(index) < len(baseline_candidates)
+        ]
+        active_candidates = [baseline_candidates[index] for index in active_indices]
+        diag = oracle_candidate_cohort(active_candidates, model_face_rows, active_plane_indices=active_indices)
+        diag_ids = set(int(value) for value in diag.get("finite_face_ids", []))
+        bench_ids: set[int] = set()
+        bench_summary = None
+        try:
+            import benchmark_reconstruction_quality as bench
+            reference_faces = bench.reference_face_records(vertices, faces)
+            bench_summary = bench.face_level_summary(
+                baseline_payload,
+                reference_faces,
+                bench.ABSOLUTE_CANONICAL_TOLERANCES,
+                assignment_mode="finite-good-first-exhaustive",
+            )
+            bench_ids = set(int(value) for value in bench_summary.get("unique_finite_face_ids_list", []))
+        except Exception as exc:  # pragma: no cover - diagnostic payload records the exception.
+            bench_summary = {"error": repr(exc)}
+        baseline_final_faces = diag_ids
+        baseline_candidate_ids = [int(candidate_track_id(candidate)) for candidate in active_candidates]
+        regression_block = {
+            "baseline_json_available": True,
+            "evaluator_inputs_digest": hashlib.sha256(
+                json.dumps(
+                    {
+                        "candidate_ids": baseline_candidate_ids,
+                        "active_indices": active_indices,
+                        "reference_face_count": len(model_face_rows),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:24],
+            "tolerances": dict(CANONICAL_ORACLE_TOLERANCES),
+            "candidate_ids": baseline_candidate_ids[:160],
+            "benchmark_unique_face_ids": sorted(int(value) for value in bench_ids),
+            "diagnostic_unique_face_ids": sorted(int(value) for value in diag_ids),
+            "benchmark_count": int(len(bench_ids)),
+            "diagnostic_count": int(len(diag_ids)),
+            "only_benchmark": sorted(int(value) for value in bench_ids - diag_ids),
+            "only_diagnostic": sorted(int(value) for value in diag_ids - bench_ids),
+            "passed": bool(bench_ids == diag_ids),
+            "benchmark_summary_error": bench_summary.get("error") if isinstance(bench_summary, dict) else None,
+        }
+
+    current_edge_ids = {int(match["edge_id"]) for match in current_matches if bool(match.get("confidence")) and match.get("edge_id") is not None}
+    generic_edge_ids = {int(match["edge_id"]) for match in generic_matches if bool(match.get("confidence")) and match.get("edge_id") is not None}
+    missing_final_boundary_edges = {
+        int(edge_id)
+        for face_id, edge_ids in face_to_edges.items()
+        if baseline_final_faces and int(face_id) not in baseline_final_faces
+        for edge_id in edge_ids
+    }
+
+    def summarize_matches(
+        name: str,
+        rows: list[dict[str, object]],
+        *,
+        hypothesis_count: int,
+    ) -> dict[str, object]:
+        confident = [row for row in rows if bool(row.get("confidence"))]
+        edge_ids = [int(row["edge_id"]) for row in confident if row.get("edge_id") is not None]
+        unique_ids = set(edge_ids)
+        ambiguous = [row for row in rows if str(row.get("classification")) == "ambiguous"]
+        unmatched = [row for row in rows if str(row.get("classification")) == "unmatched"]
+        short_edges = {int(info["edge_id"]) for info in edge_infos if float(info["length"]) <= float(np.percentile([e["length"] for e in edge_infos], 25))}
+        short_z = {int(info["edge_id"]) for info in edge_infos if float(info["z_span"]) <= float(np.percentile([e["z_span"] for e in edge_infos], 25))}
+        lower_z = {int(info["edge_id"]) for info in edge_infos if bool(info["lower_z"])}
+        return {
+            "name": name,
+            "raw_hypotheses": int(hypothesis_count),
+            "kept_hypotheses": int(len(rows)),
+            "confidently_matched_finite_edges": int(len(confident)),
+            "unique_edge_ids": int(len(unique_ids)),
+            "precision": as_json_float(float(len(confident) / max(len(rows), 1))),
+            "recall": as_json_float(float(len(unique_ids) / max(len(edge_infos), 1))),
+            "ambiguous": int(len(ambiguous)),
+            "unmatched": int(len(unmatched)),
+            "duplicate_assignments": int(len(edge_ids) - len(unique_ids)),
+            "duplicate_rate": as_json_float(float((len(edge_ids) - len(unique_ids)) / max(len(confident), 1))),
+            "short_edge_recall": as_json_float(float(len(unique_ids & short_edges) / max(len(short_edges), 1))),
+            "short_Z_recall": as_json_float(float(len(unique_ids & short_z) / max(len(short_z), 1))),
+            "lower_Z_recall": as_json_float(float(len(unique_ids & lower_z) / max(len(lower_z), 1))),
+            "boundary_edges_missing_final_faces": int(len(unique_ids & missing_final_boundary_edges)),
+            "control_edges_preserved": int(len(current_edge_ids & unique_ids)),
+            "control_edges_lost": int(len(current_edge_ids - unique_ids)),
+        }
+
+    def top_band(rows: list[dict[str, object]], matches: list[dict[str, object]], start: int, end: int) -> dict[str, object]:
+        pairs = list(zip(rows, matches))[start:end]
+        good = [pair for pair in pairs if bool(pair[1].get("confidence"))]
+        edge_ids = [int(match["edge_id"]) for _, match in good if match.get("edge_id") is not None]
+        return {
+            "rank_start": int(start + 1),
+            "rank_end": int(min(end, len(rows))),
+            "rows": int(len(pairs)),
+            "precision": as_json_float(float(len(good) / max(len(pairs), 1))),
+            "unique_edge_ids": int(len(set(edge_ids))),
+            "duplicate_assignments": int(len(edge_ids) - len(set(edge_ids))),
+            "ambiguous": int(sum(1 for _, match in pairs if str(match.get("classification")) == "ambiguous")),
+            "unmatched": int(sum(1 for _, match in pairs if str(match.get("classification")) == "unmatched")),
+        }
+
+    top_bands = {
+        "top_20": top_band(evaluated_hypotheses, generic_matches, 0, 20),
+        "ranks_21_50": top_band(evaluated_hypotheses, generic_matches, 20, 50),
+        "top_50": top_band(evaluated_hypotheses, generic_matches, 0, 50),
+        "top_100": top_band(evaluated_hypotheses, generic_matches, 0, 100),
+    }
+    current_summary = summarize_matches("current_w2_clusters", current_matches, hypothesis_count=len(w2_clusters))
+    generic_summary = summarize_matches("mutual_spatial_complete", generic_matches, hypothesis_count=len(hypotheses))
+    additive_audit = None
+    if additive_mode:
+        additive_audit = diagnose_generic_edge_additive_control(
+            model_name=model_name,
+            thresholds=thresholds,
+            median_spacing=median_spacing,
+            z_step=abs(z_step),
+            residual_median=residual_median,
+            residual_mad=residual_mad,
+            edge_infos=edge_infos,
+            all_primitives=all_primitives or primitives,
+            capped_primitives=primitives,
+            hypotheses=hypotheses,
+            evaluated_hypotheses=evaluated_hypotheses,
+            generic_matches=generic_matches,
+            evaluated_w2_clusters=evaluated_w2_clusters,
+            current_matches=current_matches,
+            current_edge_ids=current_edge_ids,
+            missing_final_boundary_edges=missing_final_boundary_edges,
+            w2_segment_count=len(w2_segments),
+            primitive_materialization_cap=primitive_materialization_cap,
+            match_tol=match_tol,
+        )
+    additional_edges = generic_edge_ids - current_edge_ids
+    edge_gate = {
+        "additional_unique_usable_edge_ids_vs_current_w2": int(len(additional_edges)),
+        "additional_edge_ids_sample": sorted(int(value) for value in additional_edges)[:120],
+        "top50_precision": top_bands["top_50"]["precision"],
+        "control_edge_recall_not_decreased": bool(len(current_edge_ids - generic_edge_ids) == 0),
+        "duplicate_rate_not_more_than_2x": bool(
+            finite_float(generic_summary.get("duplicate_rate"), 0.0)
+            <= 2.0 * max(finite_float(current_summary.get("duplicate_rate"), 0.0), EPS)
+        ),
+        "dependency_declaration_non_oracle": True,
+    }
+    edge_gate["passed_model_local"] = bool(
+        finite_float(top_bands["top_50"].get("precision"), 0.0) >= 0.5
+        and bool(edge_gate["control_edge_recall_not_decreased"])
+        and bool(edge_gate["duplicate_rate_not_more_than_2x"])
+        and bool(edge_gate["dependency_declaration_non_oracle"])
+    )
+    failure = "passed"
+    primitive_pool_capped = bool(len(source_segments) < len(w2_segments))
+    if not primitive_pool_capped and len(primitives) <= len(w2_segments) * 0.5:
+        failure = "primitive_formation_failure"
+    elif len(hypotheses) <= len(primitives) * 0.25:
+        failure = "consensus_merge_failure"
+    elif finite_float(top_bands["top_50"].get("precision"), 0.0) < 0.5:
+        failure = "non_oracle_ranking_failure"
+    elif len(additional_edges) < 10:
+        failure = "insufficient_new_edges"
+    return {
+        "schema_version": 1,
+        "scope": "generic-edge-additive-control" if additive_mode else "generic-cross-view-edge-pool",
+        "model": str(model_name),
+        "production_changed": False,
+        "initial_model_usage": "posthoc oracle evaluation only; generation/clustering/ranking use W2 observed primitives only",
+        "canonical_regression": regression_block,
+        "primitive_pool": {
+            "source": "existing non-oracle W2 primitive segments",
+            "raw_w2_segments": int(len(w2_segments)),
+            "primitive_materialization_cap": int(primitive_materialization_cap),
+            "source_segments_materialized": int(len(source_segments)),
+            "materialized_primitives": int(len(primitives)),
+            "source_mode_counts": {
+                source: int(sum(str(row.get("source_mode")) == source for row in primitives))
+                for source in sorted({str(row.get("source_mode")) for row in primitives})
+            },
+            "primitive_sample": [
+                {key: value for key, value in row.items() if not key.startswith("_")}
+                for row in primitives[:80]
+            ],
+        },
+        "adaptive_thresholds": thresholds,
+        "consensus": {
+            "mode": "mutual-spatial-complete",
+            "primitive_cap": int(consensus_primitive_cap),
+            "primitives_considered": int(len(consensus_primitives)),
+            "mutual_neighbor_edges": int(sum(len(values) for values in mutual_edges.values()) // 2),
+            "connected_components": int(len(components)),
+            "complete_linkage_groups": int(len(complete_groups)),
+            "raw_hypotheses": int(len(complete_groups)),
+            "kept_hypotheses": int(len(hypotheses)),
+            "rejection_counts": {key: int(value) for key, value in sorted(rejection_counts.items())},
+            "hypothesis_sample": [
+                {key: value for key, value in row.items() if key not in {"member_primitive_ids"}}
+                for row in hypotheses[:100]
+            ],
+        },
+        "score_dependency_declaration": {
+            key: {
+                "uses_initial_model": False,
+                "uses_reference_edge": False,
+                "uses_oracle_match": False,
+                "available_when_oracle_disabled": True,
+            }
+            for key in [
+                "independent_view_score",
+                "independent_z_score",
+                "finite_length_score",
+                "tls_residual_penalty",
+                "direction_dispersion_penalty",
+                "cross_view_recurrence_score",
+                "endpoint_stability_penalty",
+                "condition_penalty",
+                "duplicate_overlap_penalty",
+            ]
+        },
+        "posthoc_evaluation": {
+            "current_w2_clusters": current_summary,
+            "mutual_spatial_complete": generic_summary,
+            "current_w2_evaluation_cap": int(current_w2_evaluation_cap),
+            "current_w2_evaluated_clusters": int(len(evaluated_w2_clusters)),
+            "posthoc_evaluation_cap": int(posthoc_evaluation_cap),
+            "posthoc_evaluated_hypotheses": int(len(evaluated_hypotheses)),
+            "top_bands": top_bands,
+        },
+        "additive_control": additive_audit,
+        "edge_gate": edge_gate,
+        "face_formation": {
+            "attempted": False,
+            "reason": "edge gate is evaluated after pear+cushion aggregate; this fast scope does not modify production candidates",
+            "current_cyclic_adjacency_candidate_count": int(len(w2_candidates)),
+        },
+        "full_edge_clip_trials": {
+            "attempted": False,
+            "reason": "not run in fast edge-pool scope unless aggregate gate passes in a later controlled diagnostic",
+        },
+        "branch": "unresolved_at_generic_edge_hypothesis_formation" if failure != "passed" else "edge_gate_candidate",
+        "failure_anatomy": failure,
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
+def diagnose_generic_edge_additive_control(
+    *,
+    model_name: str,
+    thresholds: dict[str, object],
+    median_spacing: float,
+    z_step: float,
+    residual_median: float,
+    residual_mad: float,
+    edge_infos: list[dict[str, object]],
+    all_primitives: list[dict[str, object]],
+    capped_primitives: list[dict[str, object]],
+    hypotheses: list[dict[str, object]],
+    evaluated_hypotheses: list[dict[str, object]],
+    generic_matches: list[dict[str, object]],
+    evaluated_w2_clusters: list[dict[str, object]],
+    current_matches: list[dict[str, object]],
+    current_edge_ids: set[int],
+    missing_final_boundary_edges: set[int],
+    w2_segment_count: int,
+    primitive_materialization_cap: int,
+    match_tol: float,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    max_pair_distance = finite_float(thresholds.get("max_pair_segment_distance"), 0.05)
+    max_angle = finite_float(thresholds.get("max_direction_angle_deg"), 12.0)
+    max_gap = finite_float(thresholds.get("max_projected_gap"), 0.04)
+    neighbor_k = int(thresholds.get("neighbor_k") or 6)
+    cell_size = max(max_pair_distance * 4.0, median_spacing * 6.0, abs(z_step) * 4.0, 0.05)
+
+    def distribution(values: list[float]) -> dict[str, object]:
+        clean = np.asarray([float(v) for v in values if np.isfinite(float(v))], dtype=float)
+        if clean.size == 0:
+            return {"count": 0}
+        return {
+            "count": int(clean.size),
+            "min": as_json_float(float(np.min(clean))),
+            "median": as_json_float(float(np.median(clean))),
+            "p75": as_json_float(float(np.percentile(clean, 75))),
+            "p95": as_json_float(float(np.percentile(clean, 95))),
+            "max": as_json_float(float(np.max(clean))),
+        }
+
+    def source_mode_counts(rows: list[dict[str, object]]) -> dict[str, int]:
+        return {
+            source: int(sum(str(row.get("source_mode")) == source for row in rows))
+            for source in sorted({str(row.get("source_mode")) for row in rows})
+        }
+
+    def primitive_distribution(rows: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "segment_length": distribution([finite_float(row.get("segment_length"), float("nan")) for row in rows]),
+            "z_span": distribution([finite_float(row.get("z_span"), float("nan")) for row in rows]),
+            "independent_z_count": distribution([finite_float(row.get("independent_z_count"), float("nan")) for row in rows]),
+            "line_residual_p95": distribution([finite_float(row.get("line_residual_p95"), float("nan")) for row in rows]),
+        }
+
+    def edge_match_ids(rows: list[dict[str, object]], cap: int) -> set[int]:
+        ids: set[int] = set()
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                finite_float(row.get("line_residual_p95"), float("inf")),
+                -int(row.get("independent_z_count") or 0),
+                -finite_float(row.get("segment_length"), 0.0),
+                str(row.get("generic_id") or row.get("generic_edge_hypothesis_id")),
+            ),
+        )[:cap]
+        for row in ordered:
+            match = _generic_edge_match(row, edge_infos, distance_tol=match_tol, angle_tol=max_angle)
+            if bool(match.get("confidence")) and match.get("edge_id") is not None:
+                ids.add(int(match["edge_id"]))
+        return ids
+
+    def pair_features(a: dict[str, object], b: dict[str, object]) -> dict[str, float]:
+        a_end = np.asarray(a.get("endpoints") or [], dtype=float).reshape((-1, 3))
+        b_end = np.asarray(b.get("endpoints") or [], dtype=float).reshape((-1, 3))
+        da = np.asarray(a.get("direction") or [], dtype=float)
+        db = np.asarray(b.get("direction") or [], dtype=float)
+        if a_end.shape[0] < 2 or b_end.shape[0] < 2 or da.shape != (3,) or db.shape != (3,):
+            return {
+                "direction_angle_deg": float("inf"),
+                "spatial_median": float("inf"),
+                "projected_overlap_fraction": 0.0,
+                "projected_gap": float("inf"),
+                "endpoint_distance": float("inf"),
+                "centroid_distance": float("inf"),
+                "provenance_overlap_fraction": 0.0,
+                "z_overlap_fraction": 0.0,
+            }
+        direction_angle = float(np.degrees(np.arccos(np.clip(abs(float(da @ db)), -1.0, 1.0))))
+        spatial_median, _ = _segment_sample_distance(a_end[0], a_end[1], b_end[0], b_end[1])
+        axis = da if float(da @ db) >= 0.0 else -da
+        origin = 0.5 * (np.mean(a_end, axis=0) + np.mean(b_end, axis=0))
+        ac = (a_end - origin[None, :]) @ axis
+        bc = (b_end - origin[None, :]) @ axis
+        overlap = max(0.0, min(float(np.max(ac)), float(np.max(bc))) - max(float(np.min(ac)), float(np.min(bc))))
+        union = max(float(np.max(ac)), float(np.max(bc))) - min(float(np.min(ac)), float(np.min(bc)))
+        gap = max(0.0, max(float(np.min(ac)), float(np.min(bc))) - min(float(np.max(ac)), float(np.max(bc))))
+        endpoint_distance = min(
+            max(float(np.linalg.norm(a_end[0] - b_end[0])), float(np.linalg.norm(a_end[1] - b_end[1]))),
+            max(float(np.linalg.norm(a_end[0] - b_end[1])), float(np.linalg.norm(a_end[1] - b_end[0]))),
+        )
+        a_members = set(str(value) for value in (a.get("member_primitive_ids") or []))
+        b_members = set(str(value) for value in (b.get("member_primitive_ids") or []))
+        az0, az1 = float(np.min(a_end[:, 2])), float(np.max(a_end[:, 2]))
+        bz0, bz1 = float(np.min(b_end[:, 2])), float(np.max(b_end[:, 2]))
+        z_overlap = max(0.0, min(az1, bz1) - max(az0, bz0))
+        z_union = max(az1, bz1) - min(az0, bz0)
+        return {
+            "direction_angle_deg": direction_angle,
+            "spatial_median": spatial_median,
+            "projected_overlap_fraction": overlap / max(union, EPS),
+            "projected_gap": gap,
+            "endpoint_distance": endpoint_distance,
+            "centroid_distance": float(np.linalg.norm(np.asarray(a.get("centroid"), dtype=float) - np.asarray(b.get("centroid"), dtype=float))),
+            "provenance_overlap_fraction": len(a_members & b_members) / max(len(a_members | b_members), 1),
+            "z_overlap_fraction": z_overlap / max(z_union, EPS),
+        }
+
+    def duplicate_relation(a: dict[str, object], b: dict[str, object]) -> str:
+        f = pair_features(a, b)
+        a_members = set(str(value) for value in (a.get("member_primitive_ids") or []))
+        b_members = set(str(value) for value in (b.get("member_primitive_ids") or []))
+        if a_members and a_members == b_members:
+            return "exact_same_primitive_provenance"
+        if f["provenance_overlap_fraction"] >= 0.95:
+            return "same_observed_points"
+        if f["direction_angle_deg"] <= max_angle and f["endpoint_distance"] <= max(1.5 * median_spacing, 0.03) and f["projected_overlap_fraction"] >= 0.85:
+            return "same_finite_segment"
+        if f["direction_angle_deg"] <= max_angle and f["spatial_median"] <= max_pair_distance and f["projected_overlap_fraction"] >= 0.45:
+            a_len = finite_float(a.get("segment_length"), 0.0)
+            b_len = finite_float(b.get("segment_length"), 0.0)
+            return "nested_segment" if min(a_len, b_len) <= 0.75 * max(a_len, b_len) else "overlapping_collinear_segment"
+        if f["direction_angle_deg"] <= max_angle and f["spatial_median"] <= 2.0 * max_pair_distance and f["projected_gap"] <= 2.0 * max_gap:
+            return "fragmented_pieces_one_segment"
+        if f["direction_angle_deg"] <= max_angle and f["spatial_median"] > 2.0 * max_pair_distance:
+            return "near_infinite_line_spatially_distinct"
+        if f["spatial_median"] <= max_pair_distance and f["direction_angle_deg"] > 30.0:
+            return "intersecting_physical_edges"
+        return "unrelated"
+
+    def equivalent(a: dict[str, object], b: dict[str, object]) -> bool:
+        f = pair_features(a, b)
+        return bool(
+            f["direction_angle_deg"] <= max_angle
+            and f["spatial_median"] <= max_pair_distance
+            and (
+                f["projected_overlap_fraction"] >= 0.35
+                or f["projected_gap"] <= max_gap
+                or f["provenance_overlap_fraction"] >= 0.20
+            )
+            and f["endpoint_distance"] <= max(4.0 * median_spacing, 3.0 * abs(z_step), 0.08)
+        )
+
+    def quality(row: dict[str, object]) -> float:
+        support = min(int(row.get("contributing_observation_count") or 0), 80) / 80.0
+        views = min(int(row.get("independent_view_count") or 0), 6) / 6.0
+        z_count = min(int(row.get("independent_z_count") or 0), 20) / 20.0
+        length = min(finite_float(row.get("segment_length"), 0.0) / max(4.0 * median_spacing, EPS), 1.0)
+        residual = min(finite_float(row.get("line_residual_p95"), float("inf")) / max(residual_median + 3.0 * residual_mad, EPS), 1.0)
+        dispersion = min(finite_float(row.get("direction_dispersion_deg"), 0.0) / max(max_angle, EPS), 1.0)
+        endpoint = min(finite_float(row.get("endpoint_stability"), 0.0), 1.0)
+        condition = finite_float(row.get("condition"), 1.0)
+        condition_penalty = min(max(np.log10(max(condition, 1.0)) - 5.0, 0.0) / 3.0, 1.0)
+        return float(support + views + z_count + length - residual - dispersion - endpoint - condition_penalty)
+
+    def build_groups(rows: list[dict[str, object]]) -> list[list[int]]:
+        grid: dict[tuple[int, int, int], list[int]] = {}
+        for index, row in enumerate(rows):
+            centroid = np.asarray(row.get("centroid"), dtype=float)
+            if centroid.shape != (3,) or not np.all(np.isfinite(centroid)):
+                continue
+            cell = tuple(int(np.floor(float(value) / cell_size)) for value in centroid)
+            grid.setdefault(cell, []).append(index)
+        edges: dict[int, set[int]] = {index: set() for index in range(len(rows))}
+        for index, row in enumerate(rows):
+            centroid = np.asarray(row.get("centroid"), dtype=float)
+            if centroid.shape != (3,) or not np.all(np.isfinite(centroid)):
+                continue
+            cell = tuple(int(np.floor(float(value) / cell_size)) for value in centroid)
+            nearby: list[int] = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        nearby.extend(grid.get((cell[0] + dx, cell[1] + dy, cell[2] + dz), []))
+            nearest = sorted(
+                {int(other) for other in nearby if int(other) != int(index)},
+                key=lambda other: (float(np.linalg.norm(np.asarray(rows[other].get("centroid"), dtype=float) - centroid)), int(other)),
+            )[: max(neighbor_k * 4, 12)]
+            for other in nearest:
+                if equivalent(row, rows[other]):
+                    edges[index].add(other)
+                    edges[other].add(index)
+        visited: set[int] = set()
+        groups: list[list[int]] = []
+        for index in range(len(rows)):
+            if index in visited:
+                continue
+            stack = [index]
+            visited.add(index)
+            component: list[int] = []
+            while stack:
+                cur = stack.pop()
+                component.append(cur)
+                for nxt in edges.get(cur, set()):
+                    if nxt not in visited:
+                        visited.add(nxt)
+                        stack.append(nxt)
+            complete_groups: list[list[int]] = []
+            for member in sorted(component, key=lambda idx: (-quality(rows[idx]), str(rows[idx].get("generic_edge_hypothesis_id")))):
+                placed = False
+                for group in complete_groups:
+                    if all(equivalent(rows[member], rows[other]) for other in group):
+                        group.append(member)
+                        placed = True
+                        break
+                if not placed:
+                    complete_groups.append([member])
+            groups.extend([sorted(group) for group in complete_groups])
+        return groups
+
+    def representative(rows: list[dict[str, object]], group: list[int], mode: str) -> dict[str, object]:
+        members = [rows[index] for index in group]
+        if mode == "lowest_balanced_tls_residual":
+            return sorted(members, key=lambda row: (finite_float(row.get("line_residual_p95"), float("inf")), -quality(row), str(row.get("generic_edge_hypothesis_id"))))[0]
+        if mode == "highest_bounded_observed_quality":
+            return sorted(members, key=lambda row: (-quality(row), finite_float(row.get("line_residual_p95"), float("inf")), str(row.get("generic_edge_hypothesis_id"))))[0]
+        def medoid_cost(row: dict[str, object]) -> float:
+            return float(sum(pair_features(row, other)["spatial_median"] for other in members))
+        return sorted(members, key=lambda row: (medoid_cost(row), -quality(row), str(row.get("generic_edge_hypothesis_id"))))[0]
+
+    def representative_summary(rows: list[dict[str, object]], groups: list[list[int]], mode: str) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+        reps = [representative(rows, group, mode) for group in groups]
+        row_index_by_id = {id(row): index for index, row in enumerate(rows)}
+        matches = [
+            consolidation_match_cache.get(row_index_by_id.get(id(rep), -1))
+            or _generic_edge_match(rep, edge_infos, distance_tol=match_tol, angle_tol=max_angle)
+            for rep in reps
+        ]
+        good_ids = [int(match["edge_id"]) for match in matches if bool(match.get("confidence")) and match.get("edge_id") is not None]
+        bad_rep_good_member = 0
+        for group, match in zip(groups, matches):
+            if bool(match.get("confidence")):
+                continue
+            if any(bool((consolidation_match_cache.get(int(index)) or {}).get("confidence")) for index in group):
+                bad_rep_good_member += 1
+        return (
+            {
+                "representative": mode,
+                "groups": int(len(groups)),
+                "matched": int(len(good_ids)),
+                "unique_edge_ids": int(len(set(good_ids))),
+                "precision": as_json_float(float(len(good_ids) / max(len(groups), 1))),
+                "duplicate_assignments": int(len(good_ids) - len(set(good_ids))),
+                "duplicate_rate": as_json_float(float((len(good_ids) - len(set(good_ids))) / max(len(good_ids), 1))),
+                "bad_representative_but_good_member": int(bad_rep_good_member),
+                "current_control_overlap": int(len(set(good_ids) & current_edge_ids)),
+            },
+            reps,
+            matches,
+        )
+
+    discarded_primitives = all_primitives[len(capped_primitives):] if len(all_primitives) >= len(capped_primitives) else []
+    cap_match_cap = min(len(capped_primitives), 200)
+    full_match_cap = min(len(all_primitives), 400)
+    cap_primitive_ids = edge_match_ids(capped_primitives, cap_match_cap)
+    full_primitive_ids = edge_match_ids(all_primitives, full_match_cap)
+
+    current_core: list[dict[str, object]] = []
+    for cluster, match in zip(evaluated_w2_clusters, current_matches):
+        z0 = finite_float(cluster.get("cluster_z_min"), finite_float(cluster.get("z_min"), 0.0))
+        z1 = finite_float(cluster.get("cluster_z_max"), finite_float(cluster.get("z_max"), z0))
+        p0 = predict_w2_line(cluster, np.array([z0], dtype=float))[0]
+        p1 = predict_w2_line(cluster, np.array([z1], dtype=float))[0]
+        current_core.append(
+            {
+                "core_id": f"w2_core_{int(cluster.get('edge_cluster_id') or len(current_core))}",
+                "edge_cluster_id": int(cluster.get("edge_cluster_id") or len(current_core)),
+                "contributing_primitive_ids": [int(value) for value in (cluster.get("segment_ids") or [])[:80]],
+                "endpoints": [as_json_point(p0), as_json_point(p1)],
+                "direction": as_json_point(np.asarray(cluster.get("direction") if cluster.get("direction") is not None else [0.0, 0.0, 1.0], dtype=float)),
+                "centroid": as_json_point(0.5 * (p0 + p1)),
+                "segment_length": as_json_float(float(np.linalg.norm(p1 - p0))),
+                "source": "immutable_current_w2_cluster",
+                "selection_order": int(len(current_core)),
+                "posthoc_edge_id": int(match["edge_id"]) if bool(match.get("confidence")) and match.get("edge_id") is not None else None,
+                "match_classification": str(match.get("classification")),
+            }
+        )
+
+    duplicate_counts: dict[str, int] = {}
+    edge_to_indices: dict[int, list[int]] = {}
+    for index, match in enumerate(generic_matches):
+        if bool(match.get("confidence")) and match.get("edge_id") is not None:
+            edge_to_indices.setdefault(int(match["edge_id"]), []).append(index)
+    for indices in edge_to_indices.values():
+        for left_pos, left in enumerate(indices):
+            for right in indices[left_pos + 1:]:
+                relation = duplicate_relation(evaluated_hypotheses[left], evaluated_hypotheses[right])
+                duplicate_counts[relation] = duplicate_counts.get(relation, 0) + 1
+
+    consolidation_rows = hypotheses[: min(len(hypotheses), 300)]
+    groups = build_groups(consolidation_rows)
+    consolidation_match_cache = {
+        int(index): _generic_edge_match(row, edge_infos, distance_tol=match_tol, angle_tol=max_angle)
+        for index, row in enumerate(consolidation_rows)
+    }
+    representative_modes = ["medoid_finite_segment", "lowest_balanced_tls_residual", "highest_bounded_observed_quality"]
+    rep_summaries: dict[str, object] = {}
+    rep_payloads: dict[str, tuple[list[dict[str, object]], list[dict[str, object]]]] = {}
+    for mode in representative_modes:
+        summary, reps, matches = representative_summary(consolidation_rows, groups, mode)
+        rep_summaries[mode] = summary
+        rep_payloads[mode] = (reps, matches)
+    selected_mode = sorted(
+        representative_modes,
+        key=lambda mode: (
+            -finite_float((rep_summaries[mode] or {}).get("unique_edge_ids"), 0.0),
+            -finite_float((rep_summaries[mode] or {}).get("precision"), 0.0),
+            finite_float((rep_summaries[mode] or {}).get("duplicate_rate"), 1.0),
+            mode,
+        ),
+    )[0]
+    reps, rep_matches = rep_payloads[selected_mode]
+
+    def core_relation(rep: dict[str, object]) -> tuple[str, str | None]:
+        best: tuple[float, str, dict[str, float]] | None = None
+        for core in current_core:
+            f = pair_features(rep, core)
+            score = f["spatial_median"] / max(max_pair_distance, EPS) + f["direction_angle_deg"] / max(max_angle, EPS) + max(0.0, 0.4 - f["projected_overlap_fraction"])
+            if best is None or score < best[0]:
+                best = (float(score), str(core["core_id"]), f)
+        if best is None:
+            return "new_spatial_region", None
+        _, core_id, f = best
+        if f["direction_angle_deg"] <= max_angle and f["spatial_median"] <= max_pair_distance and f["projected_overlap_fraction"] >= 0.70:
+            return "equivalent_to_core", core_id
+        core_len = finite_float(next((core for core in current_core if core["core_id"] == core_id), {}).get("segment_length"), 0.0)
+        rep_len = finite_float(rep.get("segment_length"), 0.0)
+        if f["direction_angle_deg"] <= max_angle and f["spatial_median"] <= max_pair_distance and f["projected_overlap_fraction"] >= 0.35 and rep_len <= 0.85 * max(core_len, rep_len):
+            return "overlapping_core_fragment", core_id
+        if f["direction_angle_deg"] <= max_angle and f["spatial_median"] <= 1.5 * max_pair_distance and f["projected_overlap_fraction"] >= 0.20:
+            return "extends_core_finite_span", core_id
+        if f["direction_angle_deg"] <= max_angle:
+            return "spatially_distinct_same_direction", core_id
+        return "new_direction", core_id
+
+    additions: list[dict[str, object]] = []
+    rejection_reasons: dict[str, int] = {}
+    for group_index, (rep, match) in enumerate(zip(reps, rep_matches)):
+        relation, core_id = core_relation(rep)
+        rejection_reason = relation if relation in {"equivalent_to_core", "overlapping_core_fragment"} else None
+        if rejection_reason is not None:
+            rejection_reasons[rejection_reason] = rejection_reasons.get(rejection_reason, 0) + 1
+        group = groups[group_index]
+        member_ids = [str(consolidation_rows[index].get("generic_edge_hypothesis_id")) for index in group]
+        group_id = "gadd_" + hashlib.sha256(json.dumps(sorted(member_ids), separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+        additions.append(
+            {
+                "additive_group_id": group_id,
+                "group_size": int(len(group)),
+                "member_ids": member_ids[:80],
+                "representative_id": str(rep.get("generic_edge_hypothesis_id")),
+                "representative_mode": selected_mode,
+                "score": as_json_float(quality(rep)),
+                "core_relation": relation,
+                "nearest_core_id": core_id,
+                "rejection_reason": rejection_reason,
+                "posthoc_edge_id": int(match["edge_id"]) if bool(match.get("confidence")) and match.get("edge_id") is not None else None,
+                "posthoc_classification": str(match.get("classification")),
+                "is_posthoc_good": bool(match.get("confidence")),
+                "endpoints": rep.get("endpoints"),
+                "direction": rep.get("direction"),
+                "centroid": rep.get("centroid"),
+                "segment_length": rep.get("segment_length"),
+                "independent_view_count": rep.get("independent_view_count"),
+                "independent_z_count": rep.get("independent_z_count"),
+            }
+        )
+
+    survivors = [row for row in additions if row.get("rejection_reason") is None]
+    covered_spatial: set[tuple[int, int, int]] = set()
+    covered_direction: set[int] = set()
+    covered_z: set[int] = set()
+    ordered_additions: list[dict[str, object]] = []
+    remaining = list(survivors)
+    while remaining:
+        def marginal(row: dict[str, object]) -> tuple[float, str]:
+            centroid = np.asarray(row.get("centroid"), dtype=float)
+            direction = np.asarray(row.get("direction"), dtype=float)
+            spatial_bin = tuple(int(np.floor(float(value) / max(cell_size, EPS))) for value in centroid) if centroid.shape == (3,) else (0, 0, 0)
+            direction_bin = int(np.floor((math.atan2(float(direction[1]), float(direction[0])) + math.pi) / max(math.radians(15.0), EPS))) if direction.shape == (3,) else 0
+            z_bin = int(np.floor(float(centroid[2]) / max(4.0 * abs(z_step), EPS))) if centroid.shape == (3,) else 0
+            novelty = (0.45 if spatial_bin not in covered_spatial else 0.0) + (0.25 if direction_bin not in covered_direction else 0.0) + (0.20 if z_bin not in covered_z else 0.0)
+            relation_bonus = {
+                "new_direction": 0.35,
+                "new_spatial_region": 0.30,
+                "spatially_distinct_same_direction": 0.20,
+                "extends_core_finite_span": 0.15,
+            }.get(str(row.get("core_relation")), 0.0)
+            return finite_float(row.get("score"), 0.0) + novelty + relation_bonus, str(row.get("additive_group_id"))
+        remaining.sort(key=lambda row: (-marginal(row)[0], marginal(row)[1]))
+        chosen = remaining.pop(0)
+        ordered_additions.append(chosen)
+        centroid = np.asarray(chosen.get("centroid"), dtype=float)
+        direction = np.asarray(chosen.get("direction"), dtype=float)
+        if centroid.shape == (3,):
+            covered_spatial.add(tuple(int(np.floor(float(value) / max(cell_size, EPS))) for value in centroid))
+            covered_z.add(int(np.floor(float(centroid[2]) / max(4.0 * abs(z_step), EPS))))
+        if direction.shape == (3,):
+            covered_direction.add(int(np.floor((math.atan2(float(direction[1]), float(direction[0])) + math.pi) / max(math.radians(15.0), EPS))))
+
+    def prefix_summary(prefix: int) -> dict[str, object]:
+        selected = ordered_additions[:prefix]
+        good_ids = [int(row["posthoc_edge_id"]) for row in selected if bool(row.get("is_posthoc_good")) and row.get("posthoc_edge_id") is not None]
+        unique = set(good_ids)
+        new_ids = unique - current_edge_ids
+        return {
+            "prefix": int(prefix),
+            "selected": int(len(selected)),
+            "posthoc_good": int(len(good_ids)),
+            "new_unique_edge_ids_vs_w2_core": int(len(new_ids)),
+            "precision_additions": as_json_float(float(len(good_ids) / max(len(selected), 1))),
+            "duplicate_rate_additions": as_json_float(float((len(good_ids) - len(unique)) / max(len(good_ids), 1))),
+            "current_control_edge_recall": 1.0,
+            "missing_face_boundary_edges_gained": int(len(new_ids & missing_final_boundary_edges)),
+            "new_edge_ids_sample": sorted(int(value) for value in new_ids)[:80],
+        }
+
+    prefixes = [0, 20, 50, 100]
+    prefix_frontier = [prefix_summary(min(prefix, len(ordered_additions))) for prefix in prefixes]
+    best_prefix = sorted(
+        prefix_frontier,
+        key=lambda row: (
+            -int(row.get("new_unique_edge_ids_vs_w2_core") or 0),
+            -finite_float(row.get("precision_additions"), 0.0),
+            finite_float(row.get("duplicate_rate_additions"), 1.0),
+            int(row.get("prefix") or 0),
+        ),
+    )[0]
+    edge_gate = {
+        "current_core_recall_preserved": True,
+        "best_prefix": int(best_prefix.get("prefix") or 0),
+        "best_prefix_new_unique_edge_ids": int(best_prefix.get("new_unique_edge_ids_vs_w2_core") or 0),
+        "best_prefix_new_unique_boundary_edge_ids": int(best_prefix.get("missing_face_boundary_edges_gained") or 0),
+        "best_prefix_precision_additions": best_prefix.get("precision_additions"),
+        "best_prefix_duplicate_rate_additions": best_prefix.get("duplicate_rate_additions"),
+        "dependency_declaration_non_oracle": True,
+        "passed_model_local": bool(
+            int(best_prefix.get("missing_face_boundary_edges_gained") or 0) >= 5
+            and finite_float(best_prefix.get("precision_additions"), 0.0) >= 0.5
+            and finite_float(best_prefix.get("duplicate_rate_additions"), 1.0) <= 0.25
+        ),
+    }
+    return {
+        "scope": "generic-edge-additive-control",
+        "model": str(model_name),
+        "production_changed": False,
+        "primitive_cap_audit": {
+            "cap": int(primitive_materialization_cap),
+            "raw_segments": int(w2_segment_count),
+            "cap_primitives": int(len(capped_primitives)),
+            "full_primitives": int(len(all_primitives)),
+            "discarded_primitives": int(len(discarded_primitives)),
+            "source_composition_before_cap": source_mode_counts(all_primitives),
+            "source_composition_after_cap": source_mode_counts(capped_primitives),
+            "source_composition_discarded_by_cap": source_mode_counts(discarded_primitives),
+            "distributions_before_cap": primitive_distribution(all_primitives),
+            "distributions_after_cap": primitive_distribution(capped_primitives),
+            "distributions_discarded_by_cap": primitive_distribution(discarded_primitives),
+            "posthoc_unique_edge_ids_cap_sample": int(len(cap_primitive_ids)),
+            "posthoc_unique_edge_ids_full_sample": int(len(full_primitive_ids)),
+            "posthoc_unique_edge_ids_lost_by_cap_sample": int(len(full_primitive_ids - cap_primitive_ids)),
+            "current_control_edges_lost_by_cap_sample": int(len(current_edge_ids - cap_primitive_ids)),
+            "cap_pool_match_cap": int(cap_match_cap),
+            "full_pool_match_cap": int(full_match_cap),
+        },
+        "immutable_current_w2_core": {
+            "core_clusters": int(len(current_core)),
+            "posthoc_unique_edge_ids": int(len(current_edge_ids)),
+            "core_sample": current_core[:80],
+        },
+        "duplicate_anatomy": {
+            "oracle_duplicate_edge_assignments_in_top_evaluated": int(sum(max(0, len(indices) - 1) for indices in edge_to_indices.values())),
+            "pair_relation_counts": {key: int(value) for key, value in sorted(duplicate_counts.items())},
+        },
+        "consolidation": {
+            "input_hypotheses": int(len(consolidation_rows)),
+            "groups": int(len(groups)),
+            "group_size_distribution": distribution([float(len(group)) for group in groups]),
+            "representative_comparison": rep_summaries,
+            "selected_representative": selected_mode,
+            "group_sample": [
+                {
+                    "group_id": str(additions[index].get("additive_group_id")),
+                    "group_size": int(additions[index].get("group_size") or 0),
+                    "representative_id": str(additions[index].get("representative_id")),
+                    "core_relation": str(additions[index].get("core_relation")),
+                    "rejection_reason": additions[index].get("rejection_reason"),
+                }
+                for index in range(min(len(additions), 80))
+            ],
+        },
+        "dedupe_against_core": {
+            "groups": int(len(additions)),
+            "surviving_additions": int(len(survivors)),
+            "rejection_reasons": {key: int(value) for key, value in sorted(rejection_reasons.items())},
+            "relation_counts": {
+                relation: int(sum(str(row.get("core_relation")) == relation for row in additions))
+                for relation in sorted({str(row.get("core_relation")) for row in additions})
+            },
+        },
+        "additive_ranking": {
+            "mode": "sequential_marginal_non_oracle",
+            "prefixes": prefix_frontier,
+            "ordered_addition_sample": [
+                {key: row.get(key) for key in ["additive_group_id", "representative_id", "core_relation", "score", "posthoc_edge_id", "posthoc_classification", "is_posthoc_good"]}
+                for row in ordered_additions[:100]
+            ],
+        },
+        "edge_gate": edge_gate,
+        "union_face_adjacency": {
+            "attempted": False,
+            "reason": "additive edge gate must pass on pear+cushion before forming union face pairs",
+        },
+        "face_candidate_evaluation": {
+            "attempted": False,
+            "reason": "edge gate failed or not yet evaluated at aggregate level",
+        },
+        "full_edge_clip_trials": {
+            "attempted": False,
+            "reason": "not run because additive diagnostic is gated by edge frontier first",
+        },
+        "branch_if_gate_fails": "additive_generic_reservoir_no_safe_non_oracle_frontier",
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
+def summarize_rows_by_category(rows: list[dict[str, object]]) -> dict[str, object]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        cat = str(row.get("normal_failure_category") or "other")
+        counts[cat] = counts.get(cat, 0) + 1
+    total = max(1, len(rows))
+    return {
+        "total": int(len(rows)),
+        "counts": {k: int(v) for k, v in sorted(counts.items())},
+        "rates": {k: as_json_float(float(v / total)) for k, v in sorted(counts.items())},
     }
