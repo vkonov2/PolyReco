@@ -14,7 +14,6 @@ import numpy as np
 from generate_full_circle_split_cached_viewer import (
     EPS,
     build_half_contours,
-    lateral_axis_for_normal,
     parse_initial_model,
     parse_merged_contour,
     sorted_contour_files,
@@ -50,15 +49,22 @@ from polyreco.rms_selection import (
     annotate_w2_support_diverse_scores,
     as_json_float,
     as_json_point,
+    candidate_hull_bounds,
     candidate_hull_centroid,
+    candidate_hull_points,
     candidate_hull_polygon_2d,
     candidate_margin_against_vertices,
     candidate_outside_mask,
+    candidate_plane_relation_score,
     candidate_rank_key,
     candidate_track_id,
+    candidate_z_intervals,
     cumulative_metrics_from_mask,
     cumulative_outside_metrics,
+    finite_interval,
     finite_float,
+    hull_bounds_overlap_ratio,
+    interval_overlap,
     lp_constraints_for_candidates,
     lp_face_activity_details,
     polygon_area_2d,
@@ -78,6 +84,17 @@ from polyreco.rms_mesh import (
     reconstruct_polyhedron_from_halfspaces_edge_clip,
     reconstruct_polyhedron_from_halfspaces_incidence,
     solve_halfspace_lp,
+    topology_is_valid,
+)
+from polyreco.rms_reprojection import (
+    contour_basis,
+    convex_hull_2d,
+    evaluate_polyhedron_reprojection,
+    point_to_face_polygon_distance,
+    point_to_polygon_distance_2d,
+    project_points_to_contour_2d,
+    reprojection_directions,
+    surface_distance_summary,
 )
 from polyreco.rms_w2 import (
     build_w2_edge_segments,
@@ -2294,31 +2311,6 @@ def canonical_oracle_evaluator_metadata() -> dict[str, object]:
     }
 
 
-def point_to_face_polygon_distance(point: np.ndarray, face: dict[str, object]) -> float:
-    fn = np.array(face["normal"], dtype=float)
-    face_pts = np.array(face["vertices"], dtype=float)
-    cache = face.get("_polygon_distance_cache")
-    if isinstance(cache, dict):
-        origin = np.array(cache["origin"], dtype=float)
-        u = np.array(cache["u"], dtype=float)
-        v = np.array(cache["v"], dtype=float)
-        poly_2d = np.array(cache["poly_2d"], dtype=float)
-    else:
-        u, v = plane_basis(fn)
-        origin = np.mean(face_pts, axis=0)
-        poly_2d = np.column_stack([(face_pts - origin) @ u, (face_pts - origin) @ v])
-        face["_polygon_distance_cache"] = {
-            "origin": origin,
-            "u": u,
-            "v": v,
-            "poly_2d": poly_2d,
-        }
-    point_2d = np.array([[(point - origin) @ u, (point - origin) @ v]], dtype=float)
-    outside = float(max(0.0, polygon_signed_distances_2d(point_2d, poly_2d)[0]))
-    plane_distance = abs(float((point - face_pts[0]) @ fn))
-    return float(np.sqrt(plane_distance * plane_distance + outside * outside))
-
-
 def candidate_oracle_face(
     candidate: dict[str, object],
     model_faces: list[dict[str, object]],
@@ -2890,180 +2882,6 @@ def annotate_w2_plane_consensus_soft_scores(candidates: list[dict[str, object]],
 
 
 
-def surface_distance_summary(points: np.ndarray, faces: list[dict[str, object]], *, max_points: int = 32) -> dict[str, object]:
-    if points.size == 0 or not faces:
-        return {"median": None, "p95": None, "point_count": 0, "sampled_point_count": 0}
-    sample_points = np.asarray(points, dtype=float)
-    if sample_points.shape[0] > int(max_points):
-        idx = np.linspace(0, sample_points.shape[0] - 1, int(max_points), dtype=int)
-        sample_points = sample_points[idx]
-    vals: list[float] = []
-    for p in sample_points:
-        vals.append(min(point_to_face_polygon_distance(np.array(p, dtype=float), face) for face in faces))
-    arr = np.array(vals, dtype=float)
-    return {
-        "median": as_json_float(float(np.median(arr))),
-        "p95": as_json_float(float(np.percentile(arr, 95))),
-        "point_count": int(len(points)),
-        "sampled_point_count": int(len(sample_points)),
-    }
-
-
-def convex_hull_2d(points: np.ndarray) -> np.ndarray:
-    pts = np.asarray(points, dtype=float)
-    if pts.ndim != 2 or pts.shape[1] != 2:
-        return np.zeros((0, 2), dtype=float)
-    pts = pts[np.all(np.isfinite(pts), axis=1)]
-    if pts.shape[0] <= 1:
-        return pts.copy()
-    order = np.lexsort((pts[:, 1], pts[:, 0]))
-    pts = pts[order]
-    unique = [pts[0]]
-    for p in pts[1:]:
-        if float(np.linalg.norm(p - unique[-1])) > 1e-10:
-            unique.append(p)
-    pts = np.array(unique, dtype=float)
-    if pts.shape[0] <= 2:
-        return pts
-
-    def cross(o: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
-        return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
-
-    lower: list[np.ndarray] = []
-    for p in pts:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0.0:
-            lower.pop()
-        lower.append(p)
-    upper: list[np.ndarray] = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0.0:
-            upper.pop()
-        upper.append(p)
-    return np.array(lower[:-1] + upper[:-1], dtype=float)
-
-
-def point_to_polygon_distance_2d(points: np.ndarray, poly: np.ndarray) -> np.ndarray:
-    pts = np.asarray(points, dtype=float)
-    polygon = np.asarray(poly, dtype=float)
-    if pts.ndim != 2 or pts.shape[1] != 2 or polygon.ndim != 2 or polygon.shape[0] == 0:
-        return np.full(pts.shape[0] if pts.ndim == 2 else 0, float("inf"), dtype=float)
-    if polygon.shape[0] == 1:
-        return np.linalg.norm(pts - polygon[0][None, :], axis=1)
-    if polygon.shape[0] == 2:
-        a, b = polygon
-        ab = b - a
-        denom = max(float(ab @ ab), EPS)
-        t = np.clip(((pts - a[None, :]) @ ab) / denom, 0.0, 1.0)
-        return np.linalg.norm(pts - (a[None, :] + t[:, None] * ab[None, :]), axis=1)
-    return np.maximum(polygon_signed_distances_2d(pts, polygon), 0.0)
-
-
-def reprojection_directions(count: int) -> np.ndarray:
-    n = max(8, int(count))
-    angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False, dtype=float)
-    return np.column_stack([np.cos(angles), np.sin(angles)])
-
-
-def contour_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    u = lateral_axis_for_normal(normal)
-    v = np.cross(normal, u)
-    vn = float(np.linalg.norm(v))
-    if vn <= EPS:
-        raise ValueError("Cannot build contour basis")
-    return u, v / vn
-
-
-def project_points_to_contour_2d(points: np.ndarray, normal: np.ndarray) -> np.ndarray:
-    u, v = contour_basis(normal)
-    pts = np.asarray(points, dtype=float)
-    return np.column_stack([pts @ u, pts @ v])
-
-
-def evaluate_polyhedron_reprojection(
-    *,
-    name: str,
-    vertices_3d: np.ndarray,
-    contours: list[object],
-    direction_count: int,
-    contour_sample: int | None = None,
-) -> dict[str, object]:
-    started = time.perf_counter()
-    verts = np.asarray(vertices_3d, dtype=float)
-    if verts.ndim != 2 or verts.shape[0] == 0 or verts.shape[1] != 3:
-        return {"name": name, "valid": False, "reason": "empty_vertices"}
-    selected = list(contours)
-    if contour_sample is not None and int(contour_sample) > 0 and len(selected) > int(contour_sample):
-        idx = np.linspace(0, len(selected) - 1, int(contour_sample), dtype=int)
-        selected = [selected[int(i)] for i in idx]
-    directions = reprojection_directions(direction_count)
-    rows: list[dict[str, object]] = []
-    all_abs_support: list[float] = []
-    all_pos_support: list[float] = []
-    all_neg_support: list[float] = []
-    all_dist: list[float] = []
-    ratios: list[float] = []
-    for contour in selected:
-        normal = np.array(contour.normal, dtype=float)
-        obs2 = project_points_to_contour_2d(np.asarray(contour.points, dtype=float), normal)
-        model2 = project_points_to_contour_2d(verts, normal)
-        hull = convex_hull_2d(model2)
-        if hull.shape[0] < 3 or obs2.shape[0] < 3:
-            continue
-        h_model = np.max(hull @ directions.T, axis=0)
-        h_obs = np.max(obs2 @ directions.T, axis=0)
-        signed = h_model - h_obs
-        abs_signed = np.abs(signed)
-        pos = np.maximum(signed, 0.0)
-        neg = np.maximum(-signed, 0.0)
-        obs_hull = convex_hull_2d(obs2)
-        obs_to_model = point_to_polygon_distance_2d(obs2, hull)
-        model_to_obs = point_to_polygon_distance_2d(hull, obs_hull)
-        sym = np.concatenate([obs_to_model, model_to_obs]) if obs_to_model.size or model_to_obs.size else np.zeros(0)
-        model_area = polygon_area_2d(hull)
-        obs_area = polygon_area_2d(obs_hull)
-        ratio = model_area / max(obs_area, EPS)
-        all_abs_support.extend(float(v) for v in abs_signed if np.isfinite(v))
-        all_pos_support.extend(float(v) for v in pos if np.isfinite(v))
-        all_neg_support.extend(float(v) for v in neg if np.isfinite(v))
-        all_dist.extend(float(v) for v in sym if np.isfinite(v))
-        ratios.append(float(ratio))
-        rows.append(
-            {
-                "contour_index": int(contour.index),
-                "support_abs_median": as_json_float(float(np.median(abs_signed))),
-                "support_abs_p95": as_json_float(float(np.percentile(abs_signed, 95))),
-                "support_abs_max": as_json_float(float(np.max(abs_signed))),
-                "model_outside_observed_median": as_json_float(float(np.median(pos))),
-                "model_inside_observed_median": as_json_float(float(np.median(neg))),
-                "symmetric_contour_distance_median": as_json_float(float(np.median(sym))) if sym.size else None,
-                "symmetric_contour_distance_p95": as_json_float(float(np.percentile(sym, 95))) if sym.size else None,
-                "polygon_area_ratio": as_json_float(float(ratio)),
-                "model_hull_vertices": int(hull.shape[0]),
-                "observed_points": int(obs2.shape[0]),
-            }
-        )
-    rows.sort(key=lambda row: finite_float(row.get("support_abs_p95"), -1.0), reverse=True)
-    return {
-        "name": name,
-        "valid": True,
-        "view_count": int(len(rows)),
-        "direction_count": int(direction_count),
-        "contour_sample": int(len(selected)),
-        "support_abs_median": distribution_summary(all_abs_support).get("median"),
-        "support_abs_p95": distribution_summary(all_abs_support).get("p90"),
-        "support_abs_max": as_json_float(float(max(all_abs_support))) if all_abs_support else None,
-        "model_outside_observed_median": distribution_summary(all_pos_support).get("median"),
-        "model_inside_observed_median": distribution_summary(all_neg_support).get("median"),
-        "symmetric_contour_distance_median": distribution_summary(all_dist).get("median"),
-        "symmetric_contour_distance_p95": distribution_summary(all_dist).get("p90"),
-        "polygon_area_ratio_median": distribution_summary(ratios).get("median"),
-        "polygon_area_ratio_p10": distribution_summary(ratios).get("p10"),
-        "polygon_area_ratio_p90": distribution_summary(ratios).get("p90"),
-        "worst_views": rows[:12],
-        "timing_seconds": as_json_float(time.perf_counter() - started),
-    }
-
-
 def summarize_reconstruction_prefix(
     *,
     prefix: int,
@@ -3261,17 +3079,6 @@ def core_witness_mask_and_stats(
     }
 
 
-def topology_is_valid(topology: dict[str, object] | None) -> bool:
-    if not isinstance(topology, dict):
-        return False
-    return bool(
-        int(topology.get("euler") or 0) == 2
-        and int(topology.get("connected_components") or 0) == 1
-        and int(topology.get("boundary_edges") or 0) == 0
-        and int(topology.get("non_manifold_edges") or 0) == 0
-    )
-
-
 def value_or_default(value: object, fallback: object) -> object:
     return fallback if value is None else value
 
@@ -3328,34 +3135,6 @@ def lp_candidate_active_against(
     )
     optimum = details.get("raw_lp_optimum")
     return bool(feasible_after), bool(details.get("active")), float(optimum) if optimum is not None else None, status_after
-
-
-def candidate_plane_relation_score(a: dict[str, object], b: dict[str, object]) -> tuple[float, float, float]:
-    pa = candidate_plane(a)
-    pb = candidate_plane(b)
-    if pa is None or pb is None:
-        return float("inf"), float("inf"), float("inf")
-    p_a, n_a = pa
-    p_b, n_b = pb
-    angle = float(np.degrees(np.arccos(np.clip(abs(float(n_a @ n_b)), -1.0, 1.0))))
-    offset = abs(float(n_a @ p_a) - float(n_b @ p_b))
-    ca = candidate_hull_centroid(a)
-    cb = candidate_hull_centroid(b)
-    centroid = float(np.linalg.norm(ca - cb)) if ca is not None and cb is not None else float("inf")
-    return angle, offset, centroid
-
-
-def candidate_hull_points(candidate: dict[str, object]) -> np.ndarray:
-    hull = np.array(candidate.get("hull") or [], dtype=float)
-    if hull.ndim == 2 and hull.shape[1] == 3 and hull.shape[0] > 0:
-        return hull
-    centroid = candidate_hull_centroid(candidate)
-    if centroid is not None:
-        return np.array([centroid], dtype=float)
-    plane = candidate_plane(candidate)
-    if plane is not None:
-        return np.array([plane[0]], dtype=float)
-    return np.zeros((0, 3), dtype=float)
 
 
 def polyline_perimeter(points: np.ndarray) -> float:
@@ -3689,55 +3468,6 @@ def detect_dense_small_face_bands(candidates: list[dict[str, object]], *, bin_wi
         "bands": band_rows,
         "histogram": hist,
     }
-
-
-def finite_interval(values: list[object] | np.ndarray) -> tuple[float | None, float | None]:
-    arr = np.array(values, dtype=float)
-    if arr.ndim == 2 and arr.shape[1] >= 3:
-        arr = arr[:, 2]
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return None, None
-    return float(np.min(arr)), float(np.max(arr))
-
-
-def candidate_z_intervals(candidate: dict[str, object]) -> dict[str, object]:
-    hull = candidate_hull_points(candidate)
-    hull_min, hull_max = finite_interval(hull)
-    support_points = np.array(candidate.get("sample_points") or candidate.get("fit_points") or [], dtype=float)
-    support_min, support_max = finite_interval(support_points)
-    z_idx_min, z_idx_max = finite_interval(candidate.get("z_indices") or [])
-    track_min = finite_float(candidate.get("z_min"), float("nan"))
-    track_max = finite_float(candidate.get("z_max"), float("nan"))
-    if not np.isfinite(track_min) or not np.isfinite(track_max):
-        track_min = hull_min if hull_min is not None else support_min
-        track_max = hull_max if hull_max is not None else support_max
-    centroid = candidate_hull_centroid(candidate)
-    return {
-        "centroid_z": as_json_float(float(centroid[2])) if centroid is not None and np.isfinite(float(centroid[2])) else None,
-        "hull_z_min": as_json_float(float(hull_min)) if hull_min is not None else None,
-        "hull_z_max": as_json_float(float(hull_max)) if hull_max is not None else None,
-        "support_z_min": as_json_float(float(support_min)) if support_min is not None else None,
-        "support_z_max": as_json_float(float(support_max)) if support_max is not None else None,
-        "track_z_min": as_json_float(float(track_min)) if np.isfinite(track_min) else None,
-        "track_z_max": as_json_float(float(track_max)) if np.isfinite(track_max) else None,
-        "z_index_min": as_json_float(float(z_idx_min)) if z_idx_min is not None else None,
-        "z_index_max": as_json_float(float(z_idx_max)) if z_idx_max is not None else None,
-    }
-
-
-def interval_overlap(a0: object, a1: object, b0: object, b1: object) -> tuple[float, float]:
-    x0 = finite_float(a0, float("nan"))
-    x1 = finite_float(a1, float("nan"))
-    y0 = finite_float(b0, float("nan"))
-    y1 = finite_float(b1, float("nan"))
-    if not all(np.isfinite(v) for v in (x0, x1, y0, y1)):
-        return 0.0, 0.0
-    lo, hi = min(x0, x1), max(x0, x1)
-    blo, bhi = min(y0, y1), max(y0, y1)
-    overlap = max(0.0, min(hi, bhi) - max(lo, blo))
-    span = max(hi - lo, EPS)
-    return float(overlap), float(overlap / span)
 
 
 def distance_to_band(z: object, bands: list[dict[str, object]]) -> float | None:
@@ -5689,31 +5419,6 @@ def candidate_z_range(candidate: dict[str, object]) -> tuple[float, float]:
     if np.isfinite(z_min) and np.isfinite(z_max):
         return min(z_min, z_max), max(z_min, z_max)
     return float("nan"), float("nan")
-
-
-def candidate_hull_bounds(candidate: dict[str, object]) -> tuple[np.ndarray, np.ndarray] | None:
-    hull = np.array(candidate.get("hull") or [], dtype=float)
-    if hull.ndim != 2 or hull.shape[0] == 0 or hull.shape[1] != 3 or not np.all(np.isfinite(hull)):
-        point = np.array(candidate.get("plane_centroid", []), dtype=float)
-        if point.shape == (3,) and np.all(np.isfinite(point)):
-            hull = point.reshape((1, 3))
-        else:
-            return None
-    return np.min(hull, axis=0), np.max(hull, axis=0)
-
-
-def hull_bounds_overlap_ratio(a: dict[str, object], b: dict[str, object]) -> float:
-    bounds_a = candidate_hull_bounds(a)
-    bounds_b = candidate_hull_bounds(b)
-    if bounds_a is None or bounds_b is None:
-        return 0.0
-    amin, amax = bounds_a
-    bmin, bmax = bounds_b
-    inter = np.maximum(0.0, np.minimum(amax, bmax) - np.maximum(amin, bmin))
-    av = float(np.prod(np.maximum(amax - amin, 1e-6)))
-    bv = float(np.prod(np.maximum(bmax - bmin, 1e-6)))
-    iv = float(np.prod(np.maximum(inter, 0.0)))
-    return float(iv / max(min(av, bv), EPS))
 
 
 def candidates_plane_patch_compatible(

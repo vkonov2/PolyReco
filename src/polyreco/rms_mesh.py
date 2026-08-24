@@ -1063,6 +1063,17 @@ def polygon_area(points: np.ndarray) -> float:
     return float(area)
 
 
+def topology_is_valid(topology: dict[str, object] | None) -> bool:
+    if not isinstance(topology, dict):
+        return False
+    return bool(
+        int(topology.get("euler") or 0) == 2
+        and int(topology.get("connected_components") or 0) == 1
+        and int(topology.get("boundary_edges") or 0) == 0
+        and int(topology.get("non_manifold_edges") or 0) == 0
+    )
+
+
 __all__ = [
     "candidate_halfspace",
     "candidate_plane",
@@ -1076,4 +1087,5 @@ __all__ = [
     "reconstruct_polyhedron_from_halfspaces_edge_clip",
     "reconstruct_polyhedron_from_halfspaces_incidence",
     "solve_halfspace_lp",
+    "topology_is_valid",
 ]

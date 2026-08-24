@@ -24,15 +24,22 @@ __all__ = [
     "annotate_w2_support_diverse_scores",
     "as_json_float",
     "as_json_point",
+    "candidate_hull_bounds",
     "candidate_hull_centroid",
+    "candidate_hull_points",
     "candidate_hull_polygon_2d",
     "candidate_margin_against_vertices",
     "candidate_outside_mask",
+    "candidate_plane_relation_score",
     "candidate_rank_key",
     "candidate_track_id",
+    "candidate_z_intervals",
     "cumulative_metrics_from_mask",
     "cumulative_outside_metrics",
+    "finite_interval",
     "finite_float",
+    "hull_bounds_overlap_ratio",
+    "interval_overlap",
     "lp_constraints_for_candidates",
     "lp_face_activity_details",
     "polygon_area_2d",
@@ -81,6 +88,108 @@ def candidate_hull_centroid(candidate: dict[str, object]) -> np.ndarray | None:
             return point
         return None
     return np.mean(hull, axis=0)
+
+
+def candidate_plane_relation_score(a: dict[str, object], b: dict[str, object]) -> tuple[float, float, float]:
+    pa = candidate_plane(a)
+    pb = candidate_plane(b)
+    if pa is None or pb is None:
+        return float("inf"), float("inf"), float("inf")
+    p_a, n_a = pa
+    p_b, n_b = pb
+    angle = float(np.degrees(np.arccos(np.clip(abs(float(n_a @ n_b)), -1.0, 1.0))))
+    offset = abs(float(n_a @ p_a) - float(n_b @ p_b))
+    ca = candidate_hull_centroid(a)
+    cb = candidate_hull_centroid(b)
+    centroid = float(np.linalg.norm(ca - cb)) if ca is not None and cb is not None else float("inf")
+    return angle, offset, centroid
+
+
+def candidate_hull_points(candidate: dict[str, object]) -> np.ndarray:
+    hull = np.array(candidate.get("hull") or [], dtype=float)
+    if hull.ndim == 2 and hull.shape[1] == 3 and hull.shape[0] > 0:
+        return hull
+    centroid = candidate_hull_centroid(candidate)
+    if centroid is not None:
+        return np.array([centroid], dtype=float)
+    plane = candidate_plane(candidate)
+    if plane is not None:
+        return np.array([plane[0]], dtype=float)
+    return np.zeros((0, 3), dtype=float)
+
+
+def finite_interval(values: list[object] | np.ndarray) -> tuple[float | None, float | None]:
+    arr = np.array(values, dtype=float)
+    if arr.ndim == 2 and arr.shape[1] >= 3:
+        arr = arr[:, 2]
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None, None
+    return float(np.min(arr)), float(np.max(arr))
+
+
+def candidate_z_intervals(candidate: dict[str, object]) -> dict[str, object]:
+    hull = candidate_hull_points(candidate)
+    hull_min, hull_max = finite_interval(hull)
+    support_points = np.array(candidate.get("sample_points") or candidate.get("fit_points") or [], dtype=float)
+    support_min, support_max = finite_interval(support_points)
+    z_idx_min, z_idx_max = finite_interval(candidate.get("z_indices") or [])
+    track_min = finite_float(candidate.get("z_min"), float("nan"))
+    track_max = finite_float(candidate.get("z_max"), float("nan"))
+    if not np.isfinite(track_min) or not np.isfinite(track_max):
+        track_min = hull_min if hull_min is not None else support_min
+        track_max = hull_max if hull_max is not None else support_max
+    centroid = candidate_hull_centroid(candidate)
+    return {
+        "centroid_z": as_json_float(float(centroid[2])) if centroid is not None and np.isfinite(float(centroid[2])) else None,
+        "hull_z_min": as_json_float(float(hull_min)) if hull_min is not None else None,
+        "hull_z_max": as_json_float(float(hull_max)) if hull_max is not None else None,
+        "support_z_min": as_json_float(float(support_min)) if support_min is not None else None,
+        "support_z_max": as_json_float(float(support_max)) if support_max is not None else None,
+        "track_z_min": as_json_float(float(track_min)) if np.isfinite(track_min) else None,
+        "track_z_max": as_json_float(float(track_max)) if np.isfinite(track_max) else None,
+        "z_index_min": as_json_float(float(z_idx_min)) if z_idx_min is not None else None,
+        "z_index_max": as_json_float(float(z_idx_max)) if z_idx_max is not None else None,
+    }
+
+
+def interval_overlap(a0: object, a1: object, b0: object, b1: object) -> tuple[float, float]:
+    x0 = finite_float(a0, float("nan"))
+    x1 = finite_float(a1, float("nan"))
+    y0 = finite_float(b0, float("nan"))
+    y1 = finite_float(b1, float("nan"))
+    if not all(np.isfinite(v) for v in (x0, x1, y0, y1)):
+        return 0.0, 0.0
+    lo, hi = min(x0, x1), max(x0, x1)
+    blo, bhi = min(y0, y1), max(y0, y1)
+    overlap = max(0.0, min(hi, bhi) - max(lo, blo))
+    span = max(hi - lo, EPS)
+    return float(overlap), float(overlap / span)
+
+
+def candidate_hull_bounds(candidate: dict[str, object]) -> tuple[np.ndarray, np.ndarray] | None:
+    hull = np.array(candidate.get("hull") or [], dtype=float)
+    if hull.ndim != 2 or hull.shape[0] == 0 or hull.shape[1] != 3 or not np.all(np.isfinite(hull)):
+        point = np.array(candidate.get("plane_centroid", []), dtype=float)
+        if point.shape == (3,) and np.all(np.isfinite(point)):
+            hull = point.reshape((1, 3))
+        else:
+            return None
+    return np.min(hull, axis=0), np.max(hull, axis=0)
+
+
+def hull_bounds_overlap_ratio(a: dict[str, object], b: dict[str, object]) -> float:
+    bounds_a = candidate_hull_bounds(a)
+    bounds_b = candidate_hull_bounds(b)
+    if bounds_a is None or bounds_b is None:
+        return 0.0
+    amin, amax = bounds_a
+    bmin, bmax = bounds_b
+    inter = np.maximum(0.0, np.minimum(amax, bmax) - np.maximum(amin, bmin))
+    av = float(np.prod(np.maximum(amax - amin, 1e-6)))
+    bv = float(np.prod(np.maximum(bmax - bmin, 1e-6)))
+    iv = float(np.prod(np.maximum(inter, 0.0)))
+    return float(iv / max(min(av, bv), EPS))
 
 
 def polygon_signed_distances_2d(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
