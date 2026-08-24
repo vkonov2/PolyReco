@@ -236,6 +236,484 @@ def diagnose_append_local_frontier(
     }
 
 
+def summarize_consensus_group(
+    group_id: int,
+    members: list[dict[str, object]],
+    *,
+    cluster_by_id: dict[int, dict[str, object]],
+    model_faces: list[dict[str, object]],
+    core_ids: set[int],
+) -> dict[str, object]:
+    ranked = sorted(members, key=support_diverse_candidate_key)
+    representative = ranked[0]
+    normals: list[np.ndarray] = []
+    offsets: list[float] = []
+    for candidate in members:
+        plane = candidate_plane(candidate)
+        if plane is None:
+            continue
+        point, normal = plane
+        normals.append(normal)
+        offsets.append(float(normal @ point))
+    rep_plane = candidate_plane(representative)
+    normal_angles: list[float] = []
+    offset_deltas: list[float] = []
+    if rep_plane is not None:
+        rep_point, rep_normal = rep_plane
+        rep_offset = float(rep_normal @ rep_point)
+        for normal, offset in zip(normals, offsets):
+            normal_angles.append(float(np.degrees(np.arccos(np.clip(float(rep_normal @ normal), -1.0, 1.0)))))
+            offset_deltas.append(abs(float(offset - rep_offset)))
+
+    edge_pairs = {candidate_edge_pair(candidate) for candidate in members}
+    edge_clusters = {eid for pair in edge_pairs for eid in pair}
+    cyclic_indices: set[int] = set()
+    z_bands: set[int] = set()
+    for candidate in members:
+        z0, z1 = candidate_z_range(candidate)
+        if np.isfinite(z0) and np.isfinite(z1):
+            for band in range(int(np.floor(z0 / 0.25)), int(np.floor(z1 / 0.25)) + 1):
+                z_bands.add(int(band))
+        for eid in candidate_edge_pair(candidate):
+            cluster = cluster_by_id.get(int(eid), {})
+            member_cyclic_indices = cluster.get("member_cyclic_indices")
+            if isinstance(member_cyclic_indices, list):
+                for ci in member_cyclic_indices:
+                    try:
+                        cyclic_indices.add(int(ci))
+                    except (TypeError, ValueError):
+                        pass
+            if "cyclic_index" in cluster:
+                try:
+                    cyclic_indices.add(int(cluster["cyclic_index"]))
+                except (TypeError, ValueError):
+                    pass
+
+    oracle_rows: list[dict[str, object]] = []
+    finite_ids: list[int] = []
+    plane_ids: list[int] = []
+    for candidate in members:
+        match = candidate_oracle_face(candidate, model_faces)
+        if match is None:
+            continue
+        row = {"candidate_id": candidate_track_id(candidate), **match}
+        oracle_rows.append(row)
+        if bool(match.get("plane_good")):
+            plane_ids.append(int(match["face_id"]))
+        if bool(match.get("finite_good")):
+            finite_ids.append(int(match["face_id"]))
+    rep_match = candidate_oracle_face(representative, model_faces)
+    finite_unique = set(finite_ids)
+    member_match_by_id = {int(row["candidate_id"]): row for row in oracle_rows}
+
+    def medoid_key(candidate: dict[str, object]) -> tuple[float, float, int]:
+        score = 0.0
+        plane = candidate_plane(candidate)
+        center = candidate_hull_centroid(candidate)
+        if plane is None or center is None:
+            return (float("inf"), finite_float(candidate.get("w2_support_diverse_score"), float("inf")), candidate_track_id(candidate))
+        point, normal = plane
+        offset = float(normal @ point)
+        for other in members:
+            other_plane = candidate_plane(other)
+            other_center = candidate_hull_centroid(other)
+            if other_plane is None or other_center is None:
+                continue
+            other_point, other_normal = other_plane
+            angle = float(np.degrees(np.arccos(np.clip(float(normal @ other_normal), -1.0, 1.0)))) / 1.5
+            offset_delta = abs(offset - float(other_normal @ other_point)) / 0.04
+            spatial = float(np.linalg.norm(center - other_center)) / 0.45
+            score += angle + offset_delta + min(spatial, 2.0)
+        return (float(score), finite_float(candidate.get("w2_support_diverse_score"), float("inf")), candidate_track_id(candidate))
+
+    def support_key(candidate: dict[str, object]) -> tuple[float, float, float, float, int]:
+        return (
+            -float(candidate.get("finite_support_count") or 0),
+            -finite_float(candidate.get("finite_support_density"), 0.0),
+            -finite_float(candidate.get("finite_support_purity"), 0.0),
+            finite_float(candidate.get("finite_support_residual_p95"), float("inf")),
+            candidate_track_id(candidate),
+        )
+
+    def consensus_adjusted_key(candidate: dict[str, object]) -> tuple[float, float, int]:
+        base = finite_float(candidate.get("w2_support_diverse_score"), finite_float(candidate.get("candidate_score"), 0.0))
+        group_bonus = -0.2 * min(np.log1p(max(len(members) - 1, 0)) / np.log(6.0), 1.0)
+        singleton_penalty = 0.0
+        if len(members) == 1 and int(candidate.get("finite_support_count") or 0) < 5:
+            singleton_penalty = 0.2
+        return (base + group_bonus + singleton_penalty, finite_float(candidate.get("plane_rms"), float("inf")), candidate_track_id(candidate))
+
+    representatives = {
+        "geometric_medoid": min(members, key=medoid_key),
+        "lowest_plane_rms": min(members, key=lambda c: (finite_float(c.get("plane_rms"), float("inf")), candidate_track_id(c))),
+        "highest_local_support": min(members, key=support_key),
+        "current_support_diverse_quality": ranked[0],
+        "consensus_adjusted_quality": min(members, key=consensus_adjusted_key),
+    }
+    representative_methods: dict[str, object] = {}
+    for name, candidate in representatives.items():
+        match = member_match_by_id.get(candidate_track_id(candidate)) or candidate_oracle_face(candidate, model_faces)
+        representative_methods[name] = {
+            "candidate_id": candidate_track_id(candidate),
+            "score": candidate.get("w2_support_diverse_score", candidate.get("candidate_score")),
+            "oracle": match,
+        }
+    finite_good_rows = [row for row in oracle_rows if bool(row.get("finite_good"))]
+    lp_active_new_ids = {
+        int(member_match_by_id[candidate_track_id(candidate)]["face_id"])
+        for candidate in members
+        if candidate_track_id(candidate) in member_match_by_id
+        and bool(member_match_by_id[candidate_track_id(candidate)].get("finite_good"))
+        and int(member_match_by_id[candidate_track_id(candidate)]["face_id"]) not in core_ids
+        and finite_float(candidate.get("lp_activity_optimum"), finite_float((candidate.get("w2_support_diverse_components") or {}).get("activity_margin") if isinstance(candidate.get("w2_support_diverse_components"), dict) else None, 0.0)) >= 0.03
+    }
+    bad_medoid_good_member = bool(rep_match is not None and not bool(rep_match.get("finite_good")) and finite_good_rows)
+    support_diverse_match = representative_methods["current_support_diverse_quality"]["oracle"]
+    bad_support_diverse_good_member = bool(support_diverse_match is not None and not bool(support_diverse_match.get("finite_good")) and finite_good_rows)
+    return {
+        "group_id": int(group_id),
+        "size": int(len(members)),
+        "representative_candidate_id": candidate_track_id(representative),
+        "representative_score": representative.get("w2_support_diverse_score", representative.get("w2_novelty_score")),
+        "representative_support_count": int(representative.get("finite_support_count") or 0),
+        "representative_support_density": representative.get("finite_support_density"),
+        "representative_support_purity": representative.get("finite_support_purity"),
+        "representative_support_residual_p95": representative.get("finite_support_residual_p95"),
+        "representative_plane_rms": representative.get("plane_rms"),
+        "distinct_edge_pair_count": int(len(edge_pairs)),
+        "distinct_edge_cluster_count": int(len(edge_clusters)),
+        "distinct_cyclic_pair_count": int(len(cyclic_indices)),
+        "distinct_z_band_count": int(len(z_bands)),
+        "normal_dispersion_deg_p90": distribution_summary(normal_angles).get("p90"),
+        "normal_dispersion_deg_max": as_json_float(float(max(normal_angles))) if normal_angles else None,
+        "offset_dispersion_p90": distribution_summary(offset_deltas).get("p90"),
+        "offset_dispersion_max": as_json_float(float(max(offset_deltas))) if offset_deltas else None,
+        "support_union_count_proxy": int(sum(int(candidate.get("finite_support_count") or 0) for candidate in members)),
+        "support_agreement_purity_median": distribution_summary([candidate.get("finite_support_purity") for candidate in members]).get("median"),
+        "support_density_median": distribution_summary([candidate.get("finite_support_density") for candidate in members]).get("median"),
+        "best_representative_quality": representative.get("w2_support_diverse_score", representative.get("candidate_score")),
+        "oracle_contains_finite_good": bool(finite_unique),
+        "oracle_finite_good_precision": as_json_float(float(len(finite_ids) / max(1, len(oracle_rows)))),
+        "oracle_finite_good_candidate_count": int(len(finite_ids)),
+        "oracle_finite_good_face_count": int(len(finite_unique)),
+        "oracle_finite_face_ids": sorted(int(v) for v in finite_unique),
+        "oracle_plane_face_ids": sorted(int(v) for v in set(plane_ids)),
+        "oracle_new_face_ids": sorted(int(v) for v in (finite_unique - core_ids)),
+        "oracle_lp_active_new_face_ids": sorted(int(v) for v in lp_active_new_ids),
+        "oracle_mixed_face_ids": bool(len(set(int(v) for v in finite_ids)) > 1),
+        "oracle_bad_medoid_but_good_member": bad_medoid_good_member,
+        "oracle_bad_support_diverse_but_good_member": bad_support_diverse_good_member,
+        "representative_methods": representative_methods,
+        "representative_oracle": rep_match,
+        "candidate_ids": [candidate_track_id(candidate) for candidate in ranked],
+        "sample_candidate_ids": [candidate_track_id(candidate) for candidate in ranked[:10]],
+    }
+
+
+def diagnose_plane_consensus_groups(
+    candidates: list[dict[str, object]],
+    *,
+    w2_clusters: list[dict[str, object]],
+    model_faces: list[dict[str, object]],
+    core_ids: set[int],
+) -> dict[str, object]:
+    cluster_by_id: dict[int, dict[str, object]] = {}
+    for cluster in w2_clusters:
+        if "edge_cluster_id" in cluster:
+            try:
+                cluster_by_id[int(cluster["edge_cluster_id"])] = cluster
+            except (TypeError, ValueError):
+                pass
+    ordered = sorted(candidates, key=support_diverse_candidate_key)
+    groups: list[list[dict[str, object]]] = []
+    for candidate in ordered:
+        placed = False
+        for group in groups:
+            if all(candidates_plane_patch_compatible(candidate, other) for other in group):
+                group.append(candidate)
+                placed = True
+                break
+        if not placed:
+            groups.append([candidate])
+
+    group_rows = [
+        summarize_consensus_group(
+            i,
+            group,
+            cluster_by_id=cluster_by_id,
+            model_faces=model_faces,
+            core_ids=core_ids,
+        )
+        for i, group in enumerate(groups)
+    ]
+    stable_rows = [row for row in group_rows if int(row.get("size") or 0) >= 2]
+    singleton_rows = [row for row in group_rows if int(row.get("size") or 0) == 1]
+    representative_ids = {
+        int((row.get("representative_oracle") or {}).get("face_id"))
+        for row in group_rows
+        if bool((row.get("representative_oracle") or {}).get("finite_good"))
+    }
+    stable_representative_ids = {
+        int((row.get("representative_oracle") or {}).get("face_id"))
+        for row in stable_rows
+        if bool((row.get("representative_oracle") or {}).get("finite_good"))
+    }
+    any_group_ids = {int(fid) for row in group_rows for fid in row.get("oracle_finite_face_ids", [])}
+    stable_any_ids = {int(fid) for row in stable_rows for fid in row.get("oracle_finite_face_ids", [])}
+    any_lp_active_new_ids = {int(fid) for row in group_rows for fid in row.get("oracle_lp_active_new_face_ids", [])}
+    stable_lp_active_new_ids = {int(fid) for row in stable_rows for fid in row.get("oracle_lp_active_new_face_ids", [])}
+
+    def precision(rows: list[dict[str, object]]) -> float | None:
+        if not rows:
+            return None
+        return float(sum(1 for row in rows if bool(row.get("oracle_contains_finite_good"))) / len(rows))
+
+    def exceptional_singleton(row: dict[str, object]) -> bool:
+        return (
+            int(row.get("size") or 0) == 1
+            and int(row.get("representative_support_count") or 0) >= 8
+            and finite_float(row.get("representative_support_density"), 0.0) >= 500.0
+            and finite_float(row.get("representative_support_purity"), 0.0) >= 0.9
+            and finite_float(row.get("representative_support_residual_p95"), 1.0) <= 0.004
+            and finite_float(row.get("representative_plane_rms"), 1.0) <= 0.00012
+        )
+
+    stable_plus_exceptional_rows = stable_rows + [row for row in singleton_rows if exceptional_singleton(row)]
+
+    def rows_ceiling(rows: list[dict[str, object]], *, method: str | None = None) -> dict[str, object]:
+        if method is None:
+            finite_ids = {int(fid) for row in rows for fid in row.get("oracle_finite_face_ids", [])}
+            lp_active_new = {int(fid) for row in rows for fid in row.get("oracle_lp_active_new_face_ids", [])}
+            finite_good_reps = int(sum(int(row.get("oracle_finite_good_candidate_count") or 0) for row in rows))
+            normal_fail = 0
+            plane_fail = 0
+            rep_count = int(sum(len(row.get("candidate_ids", [])) for row in rows))
+        else:
+            finite_ids = set()
+            lp_active_new = set()
+            finite_good_reps = 0
+            normal_fail = 0
+            plane_fail = 0
+            rep_count = 0
+            for row in rows:
+                rep = (row.get("representative_methods") or {}).get(method) or {}
+                oracle = rep.get("oracle") or {}
+                if not oracle:
+                    continue
+                rep_count += 1
+                if bool(oracle.get("finite_good")):
+                    fid = int(oracle["face_id"])
+                    finite_ids.add(fid)
+                    if fid not in core_ids:
+                        lp_active_new.add(fid)
+                    finite_good_reps += 1
+                reasons = list(oracle.get("failure_reasons") or [])
+                if "normal_angle" in reasons:
+                    normal_fail += 1
+                if "plane_distance" in reasons:
+                    plane_fail += 1
+        new_ids = finite_ids - core_ids
+        return {
+            "candidate_pool_unique_ids": int(len(finite_ids)),
+            "candidate_pool_new_ids_vs_core": int(len(new_ids)),
+            "individually_active_new_ids_proxy": sorted(int(v) for v in (lp_active_new - core_ids)),
+            "individually_active_new_id_count_proxy": int(len(lp_active_new - core_ids)),
+            "projected_retained_core_ids": int(len(core_ids)),
+            "projected_final_total_if_all_new_retained": int(len(core_ids) + len(new_ids)),
+            "finite_good_representatives": int(finite_good_reps),
+            "representative_count": int(rep_count),
+            "normal_angle_failure_rate": as_json_float(float(normal_fail / max(1, rep_count))),
+            "plane_distance_failure_rate": as_json_float(float(plane_fail / max(1, rep_count))),
+        }
+
+    representative_method_names = [
+        "geometric_medoid",
+        "lowest_plane_rms",
+        "highest_local_support",
+        "current_support_diverse_quality",
+        "consensus_adjusted_quality",
+    ]
+    representative_comparison = {
+        name: rows_ceiling(group_rows, method=name)
+        for name in representative_method_names
+    }
+
+    singleton_precision = precision(singleton_rows)
+    stable_precision = precision(stable_rows)
+    normal_failure_rows = [
+        row
+        for row in group_rows
+        if "normal_angle" in list((row.get("representative_oracle") or {}).get("failure_reasons") or [])
+    ]
+    candidate_group_lookup: dict[str, object] = {}
+    for row in group_rows:
+        compact = {
+            "group_id": row.get("group_id"),
+            "size": row.get("size"),
+            "representative_candidate_id": row.get("representative_candidate_id"),
+            "distinct_edge_pair_count": row.get("distinct_edge_pair_count"),
+            "distinct_edge_cluster_count": row.get("distinct_edge_cluster_count"),
+            "distinct_cyclic_pair_count": row.get("distinct_cyclic_pair_count"),
+            "distinct_z_band_count": row.get("distinct_z_band_count"),
+            "normal_dispersion_deg_max": row.get("normal_dispersion_deg_max"),
+            "offset_dispersion_max": row.get("offset_dispersion_max"),
+            "support_agreement_purity_median": row.get("support_agreement_purity_median"),
+            "oracle_contains_finite_good": row.get("oracle_contains_finite_good"),
+            "oracle_finite_face_ids": row.get("oracle_finite_face_ids"),
+            "oracle_new_face_ids": row.get("oracle_new_face_ids"),
+        }
+        for cid in row.get("candidate_ids", []):
+            candidate_group_lookup[str(int(cid))] = compact
+    return {
+        "candidate_count": int(len(candidates)),
+        "group_count": int(len(group_rows)),
+        "singleton_group_count": int(len(singleton_rows)),
+        "stable_group_count": int(len(stable_rows)),
+        "stable_group_size_distribution": distribution_summary([row.get("size") for row in stable_rows]),
+        "singleton_group_finite_good_rate": as_json_float(singleton_precision) if singleton_precision is not None else None,
+        "stable_group_finite_good_rate": as_json_float(stable_precision) if stable_precision is not None else None,
+        "mixed_group_count": int(sum(1 for row in group_rows if bool(row.get("oracle_mixed_face_ids")))),
+        "mixed_group_rate": as_json_float(float(sum(1 for row in group_rows if bool(row.get("oracle_mixed_face_ids"))) / max(1, len(group_rows)))),
+        "stable_mixed_group_count": int(sum(1 for row in stable_rows if bool(row.get("oracle_mixed_face_ids")))),
+        "stable_mixed_group_rate": as_json_float(float(sum(1 for row in stable_rows if bool(row.get("oracle_mixed_face_ids"))) / max(1, len(stable_rows)))),
+        "bad_medoid_but_good_member_count": int(sum(1 for row in group_rows if bool(row.get("oracle_bad_medoid_but_good_member")))),
+        "bad_support_diverse_but_good_member_count": int(sum(1 for row in group_rows if bool(row.get("oracle_bad_support_diverse_but_good_member")))),
+        "group_diameter_distributions": {
+            "normal_deg_max": distribution_summary([row.get("normal_dispersion_deg_max") for row in group_rows]),
+            "offset_max": distribution_summary([row.get("offset_dispersion_max") for row in group_rows]),
+            "stable_normal_deg_max": distribution_summary([row.get("normal_dispersion_deg_max") for row in stable_rows]),
+            "stable_offset_max": distribution_summary([row.get("offset_dispersion_max") for row in stable_rows]),
+        },
+        "corrected_consensus_ceilings": {
+            "all_candidates": rows_ceiling(group_rows),
+            "one_geometric_medoid_per_group": rows_ceiling(group_rows, method="geometric_medoid"),
+            "best_non_oracle_quality_per_group": rows_ceiling(group_rows, method="current_support_diverse_quality"),
+            "stable_groups_only_any_member": rows_ceiling(stable_rows),
+            "stable_groups_best_non_oracle_quality": rows_ceiling(stable_rows, method="current_support_diverse_quality"),
+            "stable_groups_plus_exceptional_singletons_any_member": rows_ceiling(stable_plus_exceptional_rows),
+            "stable_groups_plus_exceptional_singletons_best_non_oracle_quality": rows_ceiling(stable_plus_exceptional_rows, method="current_support_diverse_quality"),
+        },
+        "representative_method_comparison": representative_comparison,
+        "representative_unique_finite_face_ids": sorted(int(v) for v in representative_ids),
+        "representative_new_face_ids_vs_core": sorted(int(v) for v in (representative_ids - core_ids)),
+        "stable_representative_unique_finite_face_ids": sorted(int(v) for v in stable_representative_ids),
+        "stable_representative_new_face_ids_vs_core": sorted(int(v) for v in (stable_representative_ids - core_ids)),
+        "any_member_unique_finite_face_ids": sorted(int(v) for v in any_group_ids),
+        "any_member_new_face_ids_vs_core": sorted(int(v) for v in (any_group_ids - core_ids)),
+        "any_member_lp_active_new_face_ids_proxy": sorted(int(v) for v in any_lp_active_new_ids),
+        "stable_any_member_unique_finite_face_ids": sorted(int(v) for v in stable_any_ids),
+        "stable_any_member_new_face_ids_vs_core": sorted(int(v) for v in (stable_any_ids - core_ids)),
+        "stable_any_member_lp_active_new_face_ids_proxy": sorted(int(v) for v in stable_lp_active_new_ids),
+        "normal_angle_failure_group_count": int(len(normal_failure_rows)),
+        "normal_angle_failure_stable_group_count": int(sum(1 for row in normal_failure_rows if int(row.get("size") or 0) >= 2)),
+        "candidate_group_lookup": candidate_group_lookup,
+        "top_groups_by_size": sorted(group_rows, key=lambda r: (-int(r.get("size") or 0), finite_float(r.get("best_representative_quality"), float("inf"))))[:40],
+        "top_groups_by_quality": sorted(group_rows, key=lambda r: finite_float(r.get("best_representative_quality"), float("inf")))[:80],
+    }
+
+
+def classify_oracle_failure_group(match: dict[str, object] | None, core_ids: set[int]) -> str:
+    if match is None:
+        return "unmatched"
+    face_id = int(match.get("face_id", -1))
+    if bool(match.get("finite_good")):
+        return "finite_good_duplicate_of_core" if face_id in core_ids else "new_finite_good"
+    if bool(match.get("plane_good")):
+        return "plane_good_but_finite_patch_bad"
+    reasons = list(match.get("failure_reasons") or [])
+    if "normal_angle" in reasons:
+        return "normal_angle_failure"
+    if "plane_distance" in reasons:
+        return "plane_distance_failure"
+    if "centroid_to_finite_polygon_distance" in reasons:
+        return "centroid_failure"
+    if "median_hull_to_surface_distance" in reasons:
+        return "hull_surface_failure"
+    return "unmatched"
+
+
+def summarize_false_active_w2(
+    *,
+    w2_active_candidates: list[dict[str, object]],
+    w2_accepted_candidates: list[dict[str, object]],
+    model_faces: list[dict[str, object]],
+    core_ids: set[int],
+    consensus_diagnostics: dict[str, object] | None,
+) -> dict[str, object]:
+    accepted_rank = {candidate_track_id(c): i + 1 for i, c in enumerate(w2_accepted_candidates)}
+    consensus_by_candidate: dict[int, dict[str, object]] = {}
+    if consensus_diagnostics:
+        for cid, row in (consensus_diagnostics.get("candidate_group_lookup") or {}).items():
+            consensus_by_candidate[int(cid)] = row
+        for row in list(consensus_diagnostics.get("top_groups_by_quality", [])) + list(consensus_diagnostics.get("top_groups_by_size", [])):
+            for cid in row.get("candidate_ids", row.get("sample_candidate_ids", [])):
+                consensus_by_candidate[int(cid)] = row
+    rows_by_group: dict[str, list[dict[str, object]]] = {}
+    for candidate in w2_active_candidates:
+        cid = candidate_track_id(candidate)
+        match = candidate_oracle_face(candidate, model_faces)
+        group_name = classify_oracle_failure_group(match, core_ids)
+        consensus = consensus_by_candidate.get(cid, {})
+        components = candidate.get("w2_support_diverse_components") if isinstance(candidate.get("w2_support_diverse_components"), dict) else {}
+        row = {
+            "candidate_id": int(cid),
+            "rank": int(accepted_rank.get(cid, 0)),
+            "oracle_match": match,
+            "edge_pair": list(candidate_edge_pair(candidate)),
+            "consensus_group_size": consensus.get("size"),
+            "consensus_distinct_edge_pair_count": consensus.get("distinct_edge_pair_count"),
+            "consensus_distinct_edge_cluster_count": consensus.get("distinct_edge_cluster_count"),
+            "consensus_distinct_cyclic_pair_count": consensus.get("distinct_cyclic_pair_count"),
+            "consensus_distinct_z_band_count": consensus.get("distinct_z_band_count"),
+            "consensus_normal_dispersion_deg_max": consensus.get("normal_dispersion_deg_max"),
+            "consensus_offset_dispersion_max": consensus.get("offset_dispersion_max"),
+            "plane_rms": candidate.get("plane_rms"),
+            "robust_inlier_fraction": candidate.get("robust_inlier_fraction"),
+            "support_density": candidate.get("finite_support_density"),
+            "support_count": candidate.get("finite_support_count"),
+            "support_purity": candidate.get("finite_support_purity"),
+            "support_residual_p95": candidate.get("finite_support_residual_p95"),
+            "hull_overlap_proxy": consensus.get("support_agreement_purity_median"),
+            "marginal_support_coverage": components.get("coverage"),
+            "activity_margin": components.get("activity_margin", candidate.get("lp_activity_optimum")),
+            "score": candidate.get("w2_support_diverse_score", candidate.get("candidate_score")),
+        }
+        rows_by_group.setdefault(group_name, []).append(row)
+
+    feature_keys = [
+        "rank",
+        "consensus_group_size",
+        "consensus_distinct_edge_pair_count",
+        "consensus_distinct_edge_cluster_count",
+        "consensus_distinct_cyclic_pair_count",
+        "consensus_distinct_z_band_count",
+        "consensus_normal_dispersion_deg_max",
+        "consensus_offset_dispersion_max",
+        "plane_rms",
+        "robust_inlier_fraction",
+        "support_density",
+        "support_count",
+        "support_purity",
+        "support_residual_p95",
+        "hull_overlap_proxy",
+        "marginal_support_coverage",
+        "activity_margin",
+        "score",
+    ]
+    groups: dict[str, object] = {}
+    for name, rows in sorted(rows_by_group.items()):
+        groups[name] = {
+            "count": int(len(rows)),
+            "feature_distributions": {key: distribution_summary([row.get(key) for row in rows]) for key in feature_keys},
+            "candidate_ids_sample": [int(row["candidate_id"]) for row in sorted(rows, key=lambda r: int(r.get("rank") or 0))[:80]],
+        }
+    return {
+        "active_w2_count": int(len(w2_active_candidates)),
+        "groups": groups,
+    }
+
+
+
 def normal_bin(candidate: dict[str, object]) -> str:
     plane = candidate_plane(candidate)
     if plane is None:
