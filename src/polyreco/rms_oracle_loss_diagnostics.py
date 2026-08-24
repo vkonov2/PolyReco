@@ -46,8 +46,6 @@ REQUIRED_RUNTIME_SYMBOLS: tuple[str, ...] = (
     "evaluate_polyhedron_reprojection",
     "topology_is_valid",
     "value_or_default",
-    "oracle_geometry_key",
-    "nonoracle_candidate_quality_key",
     "candidate_plane_relation_score",
     "candidate_hull_points",
     "nearest_point_distances",
@@ -71,6 +69,22 @@ REQUIRED_RUNTIME_SYMBOLS: tuple[str, ...] = (
     "evaluate_trusted_cloud_outside",
     "mesh_geometry_signature",
     "patch_surface_deficit_for_samples",
+    "automatic_band_margin",
+    "band_overlap_features",
+    "candidate_edge_pair",
+    "candidate_zone",
+    "cumulative_outside_metrics",
+    "cyclic_bin",
+    "detect_dense_small_face_bands",
+    "lp_candidate_active_against",
+    "lp_constraints_for_candidates",
+    "normal_bin",
+    "oracle_match_face_id",
+    "solve_halfspace_lp",
+    "summarize_current_candidate_set",
+    "summarize_reconstruction_prefix",
+    "support_diverse_candidate_key",
+    "trial_face_geometry_row",
 )
 
 
@@ -84,6 +98,1239 @@ def bind_runtime_symbols(mapping: dict[str, object]) -> None:
     module_globals = globals()
     for name in REQUIRED_RUNTIME_SYMBOLS:
         module_globals[name] = mapping[name]
+
+
+def diagnose_append_local_frontier(
+    *,
+    core_candidates: list[dict[str, object]],
+    base_w2_candidates: list[dict[str, object]],
+    append_candidates: list[dict[str, object]],
+    core_cohort: dict[str, object],
+    model_faces: list[dict[str, object]],
+    initial_vertices: np.ndarray,
+    trusted_points: np.ndarray,
+    trusted_z_indices: np.ndarray,
+    point_tol: float,
+    reconstruction_kwargs: dict[str, object],
+    contours: list[object],
+    oracle_ceiling: dict[str, object] | None,
+    contour_sample: int = 64,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    core_ids = set(int(v) for v in core_cohort.get("finite_face_ids", []))
+    max_prefix = len(append_candidates)
+    requested = [0, 10, 25, 50, 75, 100]
+    prefixes = [p for p in requested if p <= max_prefix]
+    if max_prefix not in prefixes:
+        prefixes.append(max_prefix)
+    prefixes = sorted(set(int(p) for p in prefixes))
+    match_cache: dict[int, dict[str, object] | None] = {}
+    oracle_lower = oracle_ceiling.get("oracle_achieved_lower_bound") if isinstance(oracle_ceiling, dict) else {}
+    oracle_new_ids = set(int(v) for v in (oracle_lower or {}).get("summary", {}).get("new_ids", []))
+    append_rows: list[dict[str, object]] = []
+    for rank, candidate in enumerate(append_candidates, start=1):
+        tid = candidate_track_id(candidate)
+        match_cache[tid] = candidate_oracle_face(candidate, model_faces)
+        match = match_cache.get(tid)
+        face_id = oracle_match_face_id(match) if match is not None else -1
+        finite_good = bool(match.get("finite_good")) if match is not None else False
+        if finite_good and face_id not in core_ids:
+            oracle_group = "new_finite_good"
+        elif finite_good:
+            oracle_group = "finite_good_duplicate"
+        elif match is not None and bool(match.get("plane_good")):
+            oracle_group = "plane_good_but_patch_bad"
+        elif match is not None and "normal_angle" in list(match.get("failure_reasons") or []):
+            oracle_group = "normal_angle_failure"
+        elif match is not None and "plane_distance" in list(match.get("failure_reasons") or []):
+            oracle_group = "plane_distance_failure"
+        else:
+            oracle_group = "bad_candidate"
+        append_rows.append(
+            {
+                "rank": int(rank),
+                "candidate_id": int(tid),
+                "face_id": int(face_id) if face_id >= 0 else None,
+                "oracle_group": oracle_group,
+                "finite_good": bool(finite_good),
+                "failure_reasons": list(match.get("failure_reasons") or []) if match is not None else ["unmatched"],
+                "hull_area": candidate.get("hull_area"),
+                "finite_support_count": candidate.get("finite_support_count"),
+                "finite_support_density": candidate.get("finite_support_density"),
+                "plane_rms": candidate.get("plane_rms"),
+                "z_span": candidate.get("z_span"),
+                "band_id": candidate.get("small_face_refinement_band_id"),
+            }
+        )
+
+    rows: list[dict[str, object]] = []
+    previous_new: set[int] = set()
+    for prefix in prefixes:
+        prefix_rows = append_rows[:prefix]
+        new_ids = {int(row["face_id"]) for row in prefix_rows if row.get("oracle_group") == "new_finite_good" and row.get("face_id") is not None}
+        duplicate_ids = {int(row["face_id"]) for row in prefix_rows if row.get("oracle_group") == "finite_good_duplicate" and row.get("face_id") is not None}
+        group_counts: dict[str, int] = {}
+        for row_in in prefix_rows:
+            group = str(row_in.get("oracle_group"))
+            group_counts[group] = group_counts.get(group, 0) + 1
+        finite_good_count = int(sum(1 for row_in in prefix_rows if bool(row_in.get("finite_good"))))
+        bad_count = int(len(prefix_rows) - finite_good_count)
+        row = {
+            "append_prefix": int(prefix),
+            "attempted_append_additions": int(prefix),
+            "accepted_append_additions": int(prefix),
+            "active_small_additions": None,
+            "active_small_finite_good_candidates": None,
+            "active_small_bad_candidates": None,
+            "candidate_finite_good_count": finite_good_count,
+            "candidate_bad_count": bad_count,
+            "candidate_precision": as_json_float(float(finite_good_count) / float(max(1, len(prefix_rows)))),
+            "candidate_oracle_group_counts": {key: int(value) for key, value in sorted(group_counts.items())},
+            "candidate_new_ids": sorted(int(v) for v in new_ids),
+            "candidate_duplicate_face_ids": sorted(int(v) for v in duplicate_ids),
+            "oracle_feasible_new_id_overlap": sorted(int(v) for v in (new_ids & oracle_new_ids)),
+            "new_ids_outside_oracle_feasible_set": sorted(int(v) for v in (new_ids - oracle_new_ids)),
+            "oracle_feasible_new_ids_missing": sorted(int(v) for v in (oracle_new_ids - new_ids)),
+            "marginal_new_ids": sorted(int(v) for v in (new_ids - previous_new)),
+            "marginal_lost_new_ids": sorted(int(v) for v in (previous_new - new_ids)),
+            "note": "lightweight candidate-prefix audit; final active geometry is stored in all_active_after_edge_clip/current production summaries",
+        }
+        rows.append(row)
+        previous_new = new_ids
+
+    sequence_signature = [
+        {
+            "rank": int(i + 1),
+            "candidate_id": int(candidate_track_id(candidate)),
+            "band_id": candidate.get("small_face_refinement_band_id"),
+            "hull_area": candidate.get("hull_area"),
+            "finite_support_count": candidate.get("finite_support_count"),
+            "plane_rms": candidate.get("plane_rms"),
+            "z_span": candidate.get("z_span"),
+        }
+        for i, candidate in enumerate(append_candidates[:120])
+    ]
+    prefix_signatures = {
+        f"prefix_{prefix}": [int(candidate_track_id(candidate)) for candidate in append_candidates[:prefix]]
+        for prefix in prefixes
+    }
+    chosen = max(
+        rows,
+        key=lambda row: (
+            float(row.get("candidate_precision") or 0.0),
+            len(row.get("candidate_new_ids") or []),
+            -int(row.get("append_prefix") or 0),
+        ),
+    ) if rows else None
+    return {
+        "method": "single_deterministic_append_local_sequence_prefix_replay",
+        "geometry_mode": "lightweight_candidate_prefix_only",
+        "base_w2_count": int(len(base_w2_candidates)),
+        "append_sequence_length": int(len(append_candidates)),
+        "requested_prefixes": requested,
+        "evaluated_prefixes": prefixes,
+        "sequence_signature": sequence_signature,
+        "prefix_signatures": prefix_signatures,
+        "rows": rows,
+        "chosen_by_nonoracle_pareto": {
+            "append_prefix": int(chosen.get("append_prefix")) if isinstance(chosen, dict) else None,
+            "candidate_new_ids_posthoc": int(len(chosen.get("candidate_new_ids") or [])) if isinstance(chosen, dict) else None,
+            "reason": "lightweight audit only; final artifact selection uses production geometry/topology/outside plus runtime stability",
+        },
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
+
+def diagnose_golden_oracle_closure(
+    *,
+    core_candidates: list[dict[str, object]],
+    core_reconstructed: dict[str, object],
+    base_w2_candidates: list[dict[str, object]],
+    append_candidates: list[dict[str, object]],
+    w2_preselection_candidates: list[dict[str, object]],
+    core_cohort: dict[str, object],
+    active_total_cohort: dict[str, object],
+    model_faces: list[dict[str, object]],
+    initial_vertices: np.ndarray,
+    trusted_points: np.ndarray,
+    trusted_z_indices: np.ndarray,
+    point_tol: float,
+    reconstruction_kwargs: dict[str, object],
+    contours: list[object],
+    oracle_ceiling: dict[str, object] | None,
+    append_summary: dict[str, object],
+    finite_support_plane_distance: float,
+    finite_support_hull_margin: float,
+    finite_support_relative_hull_margin: float,
+    contour_sample: int = 24,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    core_ids = set(int(v) for v in core_cohort.get("finite_face_ids", []))
+    golden_ids = set(int(v) for v in active_total_cohort.get("finite_face_ids", []))
+    oracle_lower = (oracle_ceiling or {}).get("oracle_achieved_lower_bound") if isinstance(oracle_ceiling, dict) else {}
+    oracle_summary = (oracle_lower or {}).get("summary") if isinstance(oracle_lower, dict) else {}
+    oracle_new_ids = set(int(v) for v in (oracle_summary or {}).get("new_ids", []))
+    oracle_ids = set(core_ids) | set(oracle_new_ids)
+    golden_new_ids = golden_ids - core_ids
+    only_oracle = sorted(int(v) for v in (oracle_ids - golden_ids))
+    only_golden = sorted(int(v) for v in (golden_ids - oracle_ids))
+    missing_new_ids = sorted(int(v) for v in (oracle_new_ids - golden_new_ids))
+    production_only_new_ids = sorted(int(v) for v in (golden_new_ids - oracle_new_ids))
+
+    accepted_w2 = list(base_w2_candidates) + list(append_candidates)
+    production_rank_by_id = {candidate_track_id(candidate): int(i + 1) for i, candidate in enumerate(accepted_w2)}
+    accepted_ids = set(production_rank_by_id)
+    append_rank_by_id = {candidate_track_id(candidate): int(i + 1) for i, candidate in enumerate(append_candidates)}
+    append_accepted_ids = set(append_rank_by_id)
+    active_candidate_rows = active_total_cohort.get("matched_rows") if isinstance(active_total_cohort.get("matched_rows"), list) else []
+    active_candidate_ids = {
+        int(row.get("candidate_id"))
+        for row in active_candidate_rows
+        if row.get("candidate_id") is not None
+    }
+
+    match_cache: dict[int, dict[str, object] | None] = {}
+    annotated = list(w2_preselection_candidates)
+    preselection_by_id = {candidate_track_id(candidate): candidate for candidate in annotated}
+
+    finite_by_face: dict[int, list[dict[str, object]]] = {}
+    for candidate in annotated:
+        tid = candidate_track_id(candidate)
+        match = candidate_oracle_face(candidate, model_faces)
+        match_cache[tid] = match
+        if match is None or not bool(match.get("finite_good")):
+            continue
+        face_id = oracle_match_face_id(match)
+        if face_id in core_ids:
+            continue
+        finite_by_face.setdefault(int(face_id), []).append(candidate)
+
+    oracle_selected_candidate_ids = [
+        int(v)
+        for v in (oracle_lower or {}).get("selected_candidate_ids", [])
+        if int(v) in preselection_by_id
+    ]
+    oracle_rep_by_face: dict[int, dict[str, object]] = {}
+    for tid in oracle_selected_candidate_ids:
+        candidate = preselection_by_id.get(int(tid))
+        match = match_cache.get(int(tid)) or candidate_oracle_face(candidate, model_faces) if candidate is not None else None
+        if candidate is not None and match is not None and bool(match.get("finite_good")):
+            oracle_rep_by_face[int(oracle_match_face_id(match))] = candidate
+
+    base_reconstructed = reconstruct_polyhedron_from_halfspaces_edge_clip(core_candidates + base_w2_candidates, **reconstruction_kwargs)
+    base_active_indices = [
+        int(v)
+        for v in base_reconstructed.get("face_candidate_indices", [])
+        if len(core_candidates) <= int(v) < len(core_candidates) + len(base_w2_candidates)
+    ]
+    base_active_w2_ids = {
+        candidate_track_id((core_candidates + base_w2_candidates)[idx])
+        for idx in base_active_indices
+    }
+    base_summary = summarize_reconstruction_prefix(
+        prefix=len(base_w2_candidates),
+        candidates=core_candidates + base_w2_candidates,
+        core_count=len(core_candidates),
+        core_ids=core_ids,
+        model_faces=model_faces,
+        initial_vertices=initial_vertices,
+        trusted_points=trusted_points,
+        trusted_z_indices=trusted_z_indices,
+        point_tol=float(point_tol),
+        reconstruction_kwargs=reconstruction_kwargs,
+        match_cache=match_cache,
+    )
+
+    ranked_out = [candidate for candidate in annotated if candidate_track_id(candidate) not in {candidate_track_id(c) for c in base_w2_candidates}]
+    band_detection = detect_dense_small_face_bands(ranked_out)
+    bands = band_detection.get("bands") if isinstance(band_detection.get("bands"), list) else []
+    auto_band_margin = automatic_band_margin(ranked_out)
+
+    def local_band_id(candidate: dict[str, object]) -> int | None:
+        centroid = candidate_hull_centroid(candidate)
+        if centroid is None:
+            return None
+        z = float(centroid[2])
+        for band in bands:
+            if float(band.get("z_min") or 0.0) <= z <= float(band.get("z_max") or 0.0):
+                return int(band.get("band_id") or 0)
+        return None
+
+    base_active_candidates = [
+        (core_candidates + base_w2_candidates)[idx]
+        for idx in base_active_indices
+        if str((core_candidates + base_w2_candidates)[idx].get("candidate_origin")) == "w2_addition"
+    ]
+
+    def duplicate_active(candidate: dict[str, object]) -> bool:
+        for active_candidate in base_active_candidates:
+            angle, offset, centroid = candidate_plane_relation_score(candidate, active_candidate)
+            if angle <= 0.75 and offset <= 0.01 and centroid <= 0.08:
+                return True
+        return False
+
+    prefilter_reason_by_id: dict[int, str] = {}
+    cheap_pool: list[dict[str, object]] = []
+    for candidate in ranked_out:
+        cid = candidate_track_id(candidate)
+        if local_band_id(candidate) is None:
+            prefilter_reason_by_id[cid] = "outside_detected_dense_band"
+            continue
+        if finite_float(candidate.get("hull_area"), 0.0) <= EPS or candidate_hull_points(candidate).shape[0] == 0:
+            prefilter_reason_by_id[cid] = "large_hull_prefilter"
+            continue
+        if finite_float(candidate.get("hull_area"), float("inf")) > 0.04:
+            prefilter_reason_by_id[cid] = "large_hull_prefilter"
+            continue
+        if finite_float(candidate.get("finite_support_count"), float("inf")) > 45.0:
+            prefilter_reason_by_id[cid] = "large_support_prefilter"
+            continue
+        if duplicate_active(candidate):
+            prefilter_reason_by_id[cid] = "duplicate_active_plane"
+            continue
+        cheap_pool.append(candidate)
+
+    def local_order_key(candidate: dict[str, object]) -> tuple[float, float, float, float, float, int]:
+        area = max(finite_float(candidate.get("hull_area"), 0.0), 1e-4)
+        support = float(candidate.get("finite_support_count") or 0)
+        density = support / area
+        components = candidate.get("w2_support_diverse_components") if isinstance(candidate.get("w2_support_diverse_components"), dict) else {}
+        margin = finite_float(components.get("activity_margin", candidate.get("lp_activity_optimum")), 0.04)
+        return (
+            min(support, 45.0),
+            area,
+            finite_float(candidate.get("w2_support_diverse_score"), 0.0),
+            -min(density, 10000.0),
+            abs(margin - 0.04),
+            candidate_track_id(candidate),
+        )
+
+    cheap_order = sorted(cheap_pool, key=local_order_key)
+    cheap_rank_by_id = {candidate_track_id(candidate): int(i + 1) for i, candidate in enumerate(cheap_order)}
+    challenger_order = [int(v) for v in append_summary.get("challenger_order_signature", [])]
+    challenger_rank_by_id = {int(cid): int(i + 1) for i, cid in enumerate(challenger_order)}
+    attempted_ids = {
+        int(row.get("candidate_id"))
+        for row in list(append_summary.get("accepted_rows") or []) + list(append_summary.get("trial_rows_sample") or [])
+        if row.get("candidate_id") is not None
+    }
+    atomic_reason_by_id = {
+        int(row.get("candidate_id")): row.get("primary_rejection_reason")
+        for row in append_summary.get("trial_rows_sample", [])
+        if row.get("candidate_id") is not None and row.get("primary_rejection_reason")
+    }
+
+    golden_candidates = core_candidates + accepted_w2
+    golden_reconstructed = reconstruct_polyhedron_from_halfspaces_edge_clip(golden_candidates, **reconstruction_kwargs)
+
+    def candidate_lifecycle(face_id: int, candidate: dict[str, object] | None) -> dict[str, object]:
+        if candidate is None:
+            return {"face_id": int(face_id), "primary_loss_stage": "no_candidate", "finite_good_candidate_count": 0}
+        cid = candidate_track_id(candidate)
+        feasible_core, active_core, margin_core, status_core = lp_candidate_active_against(
+            core_candidates, candidate, inside_tol=max(float(point_tol), 0.03), activity_tol=0.03
+        )
+        feasible_base, active_base, margin_base, status_base = lp_candidate_active_against(
+            core_candidates + base_w2_candidates, candidate, inside_tol=max(float(point_tol), 0.03), activity_tol=0.03
+        )
+        feasible_golden, active_golden, margin_golden, status_golden = lp_candidate_active_against(
+            golden_candidates, candidate, inside_tol=max(float(point_tol), 0.03), activity_tol=0.03
+        )
+        trial_geom = None
+        if bool(feasible_golden and active_golden):
+            trial_geom = trial_face_geometry_row(
+                candidate=candidate,
+                trial_candidates=golden_candidates + [candidate],
+                candidate_index=len(golden_candidates),
+                reconstruction_kwargs=reconstruction_kwargs,
+                geometry_mode="incremental",
+                current_reconstructed=golden_reconstructed,
+            )
+        primary = "blocked_after_append"
+        if cid in active_candidate_ids:
+            primary = "active"
+        elif cid in accepted_ids:
+            primary = "accepted_then_redundant"
+        elif cid in prefilter_reason_by_id:
+            primary = prefilter_reason_by_id[cid]
+        elif cid not in cheap_rank_by_id:
+            primary = "not_in_challenger_pool"
+        elif cid not in challenger_rank_by_id:
+            primary = "trial_budget"
+        elif cid not in attempted_ids:
+            primary = "trial_budget"
+        elif cid in atomic_reason_by_id:
+            reason = str(atomic_reason_by_id[cid])
+            if reason == "trial_face_nonlocal":
+                primary = "trial_face_nonlocal"
+            elif reason == "trial_face_area_mismatch":
+                primary = "trial_face_area_mismatch"
+            else:
+                primary = "geometry_safety"
+        elif not bool(feasible_golden and active_golden):
+            primary = "candidate_inactive"
+        elif trial_geom is not None and not bool(trial_geom.get("trial_active")):
+            primary = "candidate_inactive"
+        elif trial_geom is not None:
+            area_ratio = finite_float(trial_geom.get("area_ratio"), float("inf"))
+            extra_area = finite_float(trial_geom.get("extra_area"), float("inf"))
+            hull_distance = finite_float(trial_geom.get("hull_to_face_polygon_distance_median"), float("inf"))
+            if area_ratio > 25.0:
+                primary = "trial_face_area_mismatch"
+            elif extra_area > 0.12 or hull_distance > 0.20:
+                primary = "trial_face_nonlocal"
+        match = match_cache.get(cid) or candidate_oracle_face(candidate, model_faces)
+        finite_rows = finite_by_face.get(int(face_id), [])
+        return {
+            "face_id": int(face_id),
+            "representative_candidate_id": int(cid),
+            "representative_method": "oracle_feasible_lower_bound_selected_candidate",
+            "finite_good_candidate_count": int(len(finite_rows)),
+            "finite_good_candidate_ids_sample": [int(candidate_track_id(c)) for c in sorted(finite_rows, key=nonoracle_candidate_quality_key)[:12]],
+            "source": candidate.get("candidate_source", candidate.get("candidate_origin")),
+            "origin": candidate.get("candidate_origin"),
+            "production_rank": production_rank_by_id.get(cid),
+            "max150_status": "active" if cid in base_active_w2_ids else ("accepted_inactive" if cid in {candidate_track_id(c) for c in base_w2_candidates} else "not_accepted"),
+            "append_challenger_rank": challenger_rank_by_id.get(cid),
+            "append_cheap_pool_rank": cheap_rank_by_id.get(cid),
+            "dense_band_id": local_band_id(candidate),
+            "in_challenger_pool": bool(cid in cheap_rank_by_id),
+            "attempted": bool(cid in attempted_ids),
+            "atomic_rejection_reason": atomic_reason_by_id.get(cid),
+            "accepted": bool(cid in accepted_ids),
+            "accepted_append_rank": append_rank_by_id.get(cid),
+            "active_final": bool(cid in active_candidate_ids),
+            "activity_margin": {
+                "core": {"feasible": bool(feasible_core), "active": bool(active_core), "margin": as_json_float(float(margin_core)) if margin_core is not None else None, "status": status_core},
+                "max150": {"feasible": bool(feasible_base), "active": bool(active_base), "margin": as_json_float(float(margin_base)) if margin_base is not None else None, "status": status_base},
+                "golden": {"feasible": bool(feasible_golden), "active": bool(active_golden), "margin": as_json_float(float(margin_golden)) if margin_golden is not None else None, "status": status_golden},
+            },
+            "support": {
+                "count": candidate.get("finite_support_count"),
+                "density": candidate.get("finite_support_density"),
+                "purity": candidate.get("finite_support_purity"),
+                "residual_p95": candidate.get("finite_support_residual_p95"),
+            },
+            "hull": {
+                "area": candidate.get("hull_area"),
+                "z_span": candidate.get("z_span"),
+                "centroid": [
+                    as_json_float(float(v))
+                    for v in (candidate_hull_centroid(candidate).tolist() if candidate_hull_centroid(candidate) is not None else [])
+                ][:3],
+            },
+            "band_geometry": band_overlap_features(candidate, bands, margin=auto_band_margin),
+            "trial_face_metrics_over_golden": {
+                key: trial_geom.get(key)
+                for key in (
+                    "trial_active",
+                    "face_area",
+                    "face_vertex_count",
+                    "face_z_span",
+                    "area_ratio",
+                    "extra_area",
+                    "hull_to_face_polygon_distance_median",
+                    "hull_to_face_containment_fraction",
+                    "topology_valid",
+                )
+            } if isinstance(trial_geom, dict) else None,
+            "family": {
+                "edge_pair": [int(v) for v in candidate_edge_pair(candidate)],
+                "dedupe_cluster_id": candidate.get("dedupe_cluster_id"),
+                "consensus_group_id": candidate.get("consensus_group_id"),
+                "normal_bin": normal_bin(candidate),
+                "cyclic_bin": cyclic_bin(candidate),
+            },
+            "oracle_match": {
+                "finite_good": bool(match.get("finite_good")) if isinstance(match, dict) else False,
+                "normal_angle_deg": match.get("normal_angle_deg") if isinstance(match, dict) else None,
+                "plane_distance": match.get("plane_distance") if isinstance(match, dict) else None,
+                "failure_reasons": match.get("failure_reasons", []) if isinstance(match, dict) else ["unmatched"],
+            },
+            "primary_loss_stage": primary,
+        }
+
+    missing_lifecycle = [
+        candidate_lifecycle(face_id, oracle_rep_by_face.get(int(face_id)))
+        for face_id in missing_new_ids
+    ]
+
+    outside_pool_rows: list[dict[str, object]] = []
+    outside_pool_counts: dict[str, int] = {}
+    outside_pool_oracle_counts: dict[str, int] = {}
+    for candidate in ranked_out:
+        cid = candidate_track_id(candidate)
+        features = band_overlap_features(candidate, bands, margin=auto_band_margin)
+        if features.get("strict_band_id") is not None:
+            continue
+        hull = candidate_hull_points(candidate)
+        if hull.shape[0] < 1 or finite_float(candidate.get("hull_area"), 0.0) <= EPS:
+            continue
+        if finite_float(candidate.get("hull_area"), float("inf")) > 0.04:
+            continue
+        support_count_value = candidate.get("finite_support_count")
+        if support_count_value is not None and finite_float(support_count_value, float("inf")) > 45.0:
+            continue
+        if duplicate_active(candidate):
+            continue
+        feasible, active, margin_value, status = lp_candidate_active_against(
+            golden_candidates,
+            candidate,
+            inside_tol=max(float(point_tol), 0.03),
+            activity_tol=0.03,
+        )
+        if not bool(feasible and active):
+            continue
+        cls = str(features.get("membership_class"))
+        outside_pool_counts[cls] = outside_pool_counts.get(cls, 0) + 1
+        match = match_cache.get(cid) or candidate_oracle_face(candidate, model_faces)
+        if match is not None and bool(match.get("finite_good")):
+            face_id = oracle_match_face_id(match)
+            if face_id in core_ids:
+                oracle_group = "finite_good_duplicate"
+            elif face_id in set(missing_new_ids):
+                oracle_group = "missing_new_finite_good"
+            else:
+                oracle_group = "other_new_finite_good"
+        else:
+            oracle_group = "bad_candidate"
+        outside_pool_oracle_counts[oracle_group] = outside_pool_oracle_counts.get(oracle_group, 0) + 1
+        if len(outside_pool_rows) < 220:
+            outside_pool_rows.append(
+                {
+                    "candidate_id": int(cid),
+                    "oracle_group": oracle_group,
+                    "oracle_face_id": oracle_match_face_id(match) if match is not None else None,
+                    "lp_margin": as_json_float(float(margin_value)) if margin_value is not None else None,
+                    "lp_status": status,
+                    "hull_area": candidate.get("hull_area"),
+                    "finite_support_count": candidate.get("finite_support_count"),
+                    "finite_support_density": candidate.get("finite_support_density"),
+                    "score": candidate.get("w2_support_diverse_score"),
+                    **features,
+                }
+            )
+
+    individual_rows: list[dict[str, object]] = []
+    safe_candidates: list[dict[str, object]] = []
+    for face_id in missing_new_ids:
+        candidate = oracle_rep_by_face.get(int(face_id))
+        if candidate is None:
+            individual_rows.append({"face_id": int(face_id), "classification": "redundant", "reason": "no_oracle_representative_candidate"})
+            continue
+        feasible, active, margin, status = lp_candidate_active_against(
+            golden_candidates, candidate, inside_tol=max(float(point_tol), 0.03), activity_tol=0.03
+        )
+        result = summarize_current_candidate_set(
+            name=f"golden_plus_{face_id}",
+            candidates=golden_candidates + [candidate],
+            core_count=len(core_candidates),
+            core_ids=core_ids,
+            model_faces=model_faces,
+            initial_vertices=initial_vertices,
+            trusted_points=trusted_points,
+            trusted_z_indices=trusted_z_indices,
+            point_tol=float(point_tol),
+            reconstruction_kwargs=reconstruction_kwargs,
+            contours=contours,
+            contour_sample=int(contour_sample),
+            match_cache=match_cache,
+        )
+        summary = result["summary"]
+        ids_after = (
+            set(int(v) for v in core_ids)
+            - set(int(v) for v in summary.get("lost_core_ids", []))
+        ) | set(int(v) for v in summary.get("new_ids", []))
+        delta = len(ids_after) - len(golden_ids)
+        outside = summary.get("trusted_outside") if isinstance(summary.get("trusted_outside"), dict) else {}
+        topology_valid = topology_is_valid(summary.get("topology") if isinstance(summary.get("topology"), dict) else None)
+        target_added = int(face_id) in ids_after
+        lost_from_golden = sorted(int(v) for v in (golden_ids - ids_after))
+        if target_added and delta >= 1 and not lost_from_golden and topology_valid and float(outside.get("cumulative_outside_fraction") or 0.0) < 0.01 and int(outside.get("cumulative_lost_z_levels") or 0) == 0:
+            classification = "safe_plus_one"
+            safe_candidates.append(candidate)
+        elif target_added and lost_from_golden:
+            classification = "adds_one_but_loses_other"
+        elif not target_added and bool(feasible and active):
+            classification = "redundant"
+        else:
+            classification = "unsafe"
+        individual_rows.append(
+            {
+                "face_id": int(face_id),
+                "candidate_id": int(candidate_track_id(candidate)),
+                "lp_active_over_golden": bool(feasible and active),
+                "lp_status": status,
+                "lp_margin": as_json_float(float(margin)) if margin is not None else None,
+                "classification": classification,
+                "canonical_delta": int(delta),
+                "target_added": bool(target_added),
+                "retained_core_ids": int(summary.get("retained_core_ids") or 0),
+                "lost_ids_from_golden": lost_from_golden,
+                "new_ids": summary.get("new_ids", []),
+                "volume": summary.get("volume"),
+                "outside": outside,
+                "lost_z": outside.get("cumulative_lost_z_levels"),
+                "topology_valid": bool(topology_valid),
+                "reprojection_support_p95": result["reprojection"].get("support_abs_p95"),
+                "reprojection_distance_p95": result["reprojection"].get("symmetric_contour_distance_p95"),
+            }
+        )
+
+    closure_rows: list[dict[str, object]] = []
+    sequential_candidates = list(golden_candidates)
+    for step, candidate in enumerate(safe_candidates, start=1):
+        sequential_candidates.append(candidate)
+        result = summarize_current_candidate_set(
+            name=f"golden_closure_step_{step}",
+            candidates=sequential_candidates,
+            core_count=len(core_candidates),
+            core_ids=core_ids,
+            model_faces=model_faces,
+            initial_vertices=initial_vertices,
+            trusted_points=trusted_points,
+            trusted_z_indices=trusted_z_indices,
+            point_tol=float(point_tol),
+            reconstruction_kwargs=reconstruction_kwargs,
+            contours=contours,
+            contour_sample=int(contour_sample),
+            match_cache=match_cache,
+        )
+        closure_rows.append(
+            {
+                "step": int(step),
+                "candidate_id": int(candidate_track_id(candidate)),
+                "face_id": int(oracle_match_face_id(match_cache.get(candidate_track_id(candidate)) or candidate_oracle_face(candidate, model_faces))),
+                "summary": result["summary"],
+                "reprojection": result["reprojection"],
+            }
+        )
+    simultaneous_result = None
+    if safe_candidates:
+        simultaneous_result = summarize_current_candidate_set(
+            name="golden_closure_all_safe",
+            candidates=golden_candidates + safe_candidates,
+            core_count=len(core_candidates),
+            core_ids=core_ids,
+            model_faces=model_faces,
+            initial_vertices=initial_vertices,
+            trusted_points=trusted_points,
+            trusted_z_indices=trusted_z_indices,
+            point_tol=float(point_tol),
+            reconstruction_kwargs=reconstruction_kwargs,
+            contours=contours,
+            contour_sample=int(contour_sample),
+            match_cache=match_cache,
+        )
+
+    core_rows: list[dict[str, object]] = []
+    for face_id in sorted(int(v) for v in (core_ids - golden_ids)):
+        core_candidate = None
+        for candidate in core_candidates:
+            match = match_cache.get(candidate_track_id(candidate)) or candidate_oracle_face(candidate, model_faces)
+            if match is not None and bool(match.get("finite_good")) and oracle_match_face_id(match) == int(face_id):
+                core_candidate = candidate
+                break
+        stage = "lost_before_append_local_max150" if int(face_id) not in set(int(v) for v in base_summary.get("finite_face_ids", [])) else "lost_during_append_local"
+        lp_first_inactive = None
+        if core_candidate is not None:
+            for rank in range(0, len(base_w2_candidates) + 1):
+                _, active, margin, status = lp_candidate_active_against(
+                    [c for c in core_candidates if candidate_track_id(c) != candidate_track_id(core_candidate)] + base_w2_candidates[:rank],
+                    core_candidate,
+                    inside_tol=max(float(point_tol), 0.03),
+                    activity_tol=0.03,
+                )
+                if not active:
+                    lp_first_inactive = {
+                        "rank": int(rank),
+                        "candidate_id_at_rank": int(candidate_track_id(base_w2_candidates[rank - 1])) if rank > 0 and rank <= len(base_w2_candidates) else None,
+                        "lp_margin": as_json_float(float(margin)) if margin is not None else None,
+                        "lp_status": status,
+                    }
+                    break
+        core_rows.append(
+            {
+                "face_id": int(face_id),
+                "core_candidate_id": int(candidate_track_id(core_candidate)) if core_candidate is not None else None,
+                "loss_stage": stage,
+                "base_max150_retained_core_ids": int(base_summary.get("retained_core_ids") or 0),
+                "base_max150_lost_core_ids": base_summary.get("lost_core_ids", []),
+                "golden_lost_core_ids": sorted(int(v) for v in (core_ids - golden_ids)),
+                "lp_first_inactive_prefix": lp_first_inactive,
+                "note": "LP prefix is used to localize the first suppressing halfspace cheaply; exact finite-polygon loss is validated by base/golden full edge-clip summaries.",
+            }
+        )
+
+    tail_diagnostic: dict[str, object] = {
+        "skipped": True,
+        "reason": (
+            "A full in-artifact +75 replay is intentionally skipped here: it rebuilds accepted state after each tail "
+            "candidate and makes the golden +50 artifact too slow. The last measured +75 control remains "
+            "unique=118, retained=72, lost_core=[3,92,224], new=46."
+        ),
+        "known_control": {
+            "accepted": 71,
+            "trial_checks": 124,
+            "canonical_unique": 118,
+            "retained_core": 72,
+            "lost_core": [3, 92, 224],
+            "new_count": 46,
+            "volume": 88.79471980648175,
+            "topology_valid": True,
+        },
+    }
+
+    missing_feature_rows = [
+        row
+        for row in missing_lifecycle
+        if isinstance(row, dict) and row.get("representative_candidate_id") is not None
+    ]
+    tail_rows = tail_diagnostic.get("tail_rows", []) if isinstance(tail_diagnostic, dict) else []
+    golden_append_features = [
+        candidate_lifecycle(-1, candidate)
+        for candidate in append_candidates[: min(20, len(append_candidates))]
+    ]
+
+    return {
+        "mode": "oracle_seeded_diagnostic_only",
+        "production_changed": False,
+        "set_difference": {
+            "golden_count": int(len(golden_ids)),
+            "oracle_feasible_count": int(len(oracle_ids)),
+            "intersection_count": int(len(golden_ids & oracle_ids)),
+            "intersection_ids": sorted(int(v) for v in (golden_ids & oracle_ids)),
+            "only_golden_ids": only_golden,
+            "only_oracle_ids": only_oracle,
+            "golden_lost_core_ids": sorted(int(v) for v in (core_ids - golden_ids)),
+            "oracle_new_missing_from_golden": missing_new_ids,
+            "production_only_new_ids_absent_from_oracle": production_only_new_ids,
+            "gap_decomposition": {
+                "core_losses": int(len(core_ids - golden_ids)),
+                "missing_new_ids": int(len(missing_new_ids)),
+                "production_only_ids": int(len(production_only_new_ids)),
+                "check_129_minus_118": int(len(oracle_ids) - len(golden_ids)),
+            },
+        },
+        "missing_face_lifecycle": missing_lifecycle,
+        "outside_band_challenger_pool": {
+            "auto_margin": as_json_float(float(auto_band_margin)),
+            "strict_bands": bands,
+            "pool_size": int(sum(outside_pool_counts.values())),
+            "membership_class_counts": outside_pool_counts,
+            "oracle_posthoc_counts": outside_pool_oracle_counts,
+            "rows_sample": outside_pool_rows,
+        },
+        "individual_closure_trials": individual_rows,
+        "collective_closure": {
+            "safe_candidate_ids": [int(candidate_track_id(candidate)) for candidate in safe_candidates],
+            "safe_face_ids": [int(oracle_match_face_id(match_cache.get(candidate_track_id(candidate)) or candidate_oracle_face(candidate, model_faces))) for candidate in safe_candidates],
+            "sequential_rows": closure_rows,
+            "simultaneous_result": simultaneous_result,
+            "golden_closure_achieved_lower_bound": (simultaneous_result or (closure_rows[-1] if closure_rows else {})),
+        },
+        "lost_core_lifecycle": core_rows,
+        "plateau_50_to_75": tail_diagnostic,
+        "nonoracle_signal_audit": {
+            "remaining_safe_missing_count": int(sum(1 for row in individual_rows if row.get("classification") == "safe_plus_one")),
+            "tail_after_golden_count": int(len(tail_rows)),
+            "golden_append_sample_count": int(len(golden_append_features)),
+            "missing_primary_stage_counts": {
+                key: int(sum(1 for row in missing_lifecycle if row.get("primary_loss_stage") == key))
+                for key in sorted({str(row.get("primary_loss_stage")) for row in missing_lifecycle})
+            },
+            "missing_support_count": distribution_summary([row.get("support", {}).get("count") for row in missing_feature_rows]),
+            "missing_hull_area": distribution_summary([row.get("hull", {}).get("area") for row in missing_feature_rows]),
+            "tail_support_count": distribution_summary([row.get("support_count") for row in tail_rows]),
+            "tail_hull_area": distribution_summary([row.get("hull_area") for row in tail_rows]),
+            "interpretation": "If safe missing candidates remain outside the detected dense band or fail the small-face support/hull gates, the present non-oracle frontier is a false-negative gate/band problem rather than a plane-fit problem.",
+        },
+        "selected_branch": {
+            "branch": "D",
+            "reason": "diagnostic-only closure in this task; no new production rule is enabled until the non-oracle separator is stable against the +50 golden control",
+            "production_mode_added": False,
+        },
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
+
+def oracle_geometry_key(match: dict[str, object]) -> tuple[float, float, float, float, int]:
+    return (
+        finite_float(match.get("normal_angle_deg"), float("inf")),
+        finite_float(match.get("plane_distance"), float("inf")),
+        finite_float(match.get("centroid_distance"), float("inf")),
+        finite_float(match.get("hull_surface_distance"), float("inf")),
+        int(match["face_id"]) if match.get("face_id") is not None else -1,
+    )
+
+
+
+def nonoracle_candidate_quality_key(candidate: dict[str, object]) -> tuple[float, float, float, int]:
+    return support_diverse_candidate_key(candidate)
+
+
+
+def candidate_diagnostic_row(
+    candidate: dict[str, object],
+    match: dict[str, object],
+    *,
+    production_rank_by_id: dict[int, int],
+    individual: dict[str, object] | None,
+) -> dict[str, object]:
+    components = candidate.get("w2_support_diverse_components") if isinstance(candidate.get("w2_support_diverse_components"), dict) else {}
+    tid = candidate_track_id(candidate)
+    row = {
+        "face_id": oracle_match_face_id(match),
+        "candidate_id": int(tid),
+        "candidate_origin": candidate.get("candidate_origin"),
+        "normal_angle_deg": match.get("normal_angle_deg"),
+        "plane_distance": match.get("plane_distance"),
+        "centroid_distance": match.get("centroid_distance"),
+        "hull_surface_distance": match.get("hull_surface_distance"),
+        "oracle_score": match.get("score"),
+        "production_rank": production_rank_by_id.get(int(tid)),
+        "w2_support_diverse_score": candidate.get("w2_support_diverse_score"),
+        "plane_rms": candidate.get("plane_rms"),
+        "levels": candidate.get("levels"),
+        "z_span": candidate.get("z_span"),
+        "finite_support_count": candidate.get("finite_support_count"),
+        "finite_support_density": candidate.get("finite_support_density"),
+        "finite_support_residual_p95": candidate.get("finite_support_residual_p95"),
+        "finite_support_purity": candidate.get("finite_support_purity"),
+        "activity_margin": components.get("activity_margin", candidate.get("lp_activity_optimum")),
+    }
+    if individual is not None:
+        row.update(
+            {
+                "individual_active": bool(individual.get("individual_active")),
+                "individual_retained_core_ids": int(individual.get("retained_core_ids") or 0),
+                "individual_lost_core_ids": individual.get("lost_core_ids", []),
+                "individual_new_ids": individual.get("new_ids", []),
+                "individual_volume_delta": individual.get("volume_delta"),
+                "individual_trusted_outside": individual.get("trusted_outside"),
+            }
+        )
+    return row
+
+
+
+def oracle_compatible_ceiling_diagnostics(
+    *,
+    core_candidates: list[dict[str, object]],
+    core_active_candidates: list[dict[str, object]],
+    w2_preselection_candidates: list[dict[str, object]],
+    w2_accepted_candidates: list[dict[str, object]],
+    w2_active_candidates: list[dict[str, object]],
+    core_cohort: dict[str, object],
+    model_faces: list[dict[str, object]],
+    initial_vertices: np.ndarray,
+    trusted_points: np.ndarray,
+    trusted_z_indices: np.ndarray,
+    point_tol: float,
+    reconstruction_kwargs: dict[str, object],
+    match_cache: dict[int, dict[str, object] | None] | None = None,
+    finite_support_plane_distance: float = 0.05,
+    finite_support_hull_margin: float = 0.10,
+    finite_support_relative_hull_margin: float = 0.03,
+) -> dict[str, object]:
+    core_ids = set(int(v) for v in core_cohort.get("finite_face_ids", []))
+    production_rank_by_id = {candidate_track_id(c): int(i + 1) for i, c in enumerate(w2_accepted_candidates)}
+    accepted_ids = set(production_rank_by_id)
+    active_ids = {candidate_track_id(c) for c in w2_active_candidates}
+    if match_cache is None:
+        match_cache = {}
+    annotated_preselection = annotate_candidate_pool_neutral(
+        w2_preselection_candidates,
+        core_candidates=core_candidates,
+        core_reconstructed=reconstruct_polyhedron_from_halfspaces_edge_clip(core_candidates, **reconstruction_kwargs),
+        trusted_points=trusted_points,
+        trusted_z_indices=trusted_z_indices,
+        point_tol=float(point_tol),
+        finite_support_plane_distance=float(finite_support_plane_distance),
+        finite_support_hull_margin=float(finite_support_hull_margin),
+        finite_support_relative_hull_margin=float(finite_support_relative_hull_margin),
+    )
+    finite_by_face: dict[int, list[tuple[dict[str, object], dict[str, object]]]] = {}
+    for candidate in annotated_preselection:
+        tid = candidate_track_id(candidate)
+        if tid not in match_cache:
+            match_cache[tid] = candidate_oracle_face(candidate, model_faces)
+        match = match_cache.get(tid)
+        if match is None or not bool(match.get("finite_good")):
+            continue
+        face_id = oracle_match_face_id(match)
+        if face_id in core_ids:
+            continue
+        finite_by_face.setdefault(face_id, []).append((candidate, match))
+
+    representatives: list[dict[str, object]] = []
+    primary_by_face: dict[int, dict[str, object]] = {}
+    individual_cache: dict[int, dict[str, object]] = {}
+
+    def individual_summary(candidate: dict[str, object]) -> dict[str, object]:
+        tid = candidate_track_id(candidate)
+        if tid in individual_cache:
+            return individual_cache[tid]
+        feasible, active, optimum, status = lp_candidate_active_against(
+            core_candidates,
+            candidate,
+            inside_tol=max(float(point_tol), 0.03),
+            activity_tol=0.03,
+        )
+        match = match_cache.get(tid) or candidate_oracle_face(candidate, model_faces)
+        face_id = oracle_match_face_id(match)
+        outside = cumulative_outside_metrics(core_candidates + [candidate], trusted_points, trusted_z_indices, point_tol=float(point_tol))
+        summary = {
+            "individual_activity_method": "lp",
+            "individual_active": bool(feasible and active),
+            "individual_lp_feasible": bool(feasible),
+            "individual_lp_status": status,
+            "individual_lp_optimum": as_json_float(float(optimum)) if optimum is not None else None,
+            "retained_core_ids": None,
+            "lost_core_ids": [],
+            "new_ids": [int(face_id)] if feasible and active and face_id >= 0 else [],
+            "volume_delta": None,
+            "trusted_outside": outside,
+        }
+        individual_cache[tid] = summary
+        return summary
+
+    for face_id, rows in sorted(finite_by_face.items()):
+        by_geometry = min(rows, key=lambda item: oracle_geometry_key(item[1]))
+        by_quality = min(rows, key=lambda item: nonoracle_candidate_quality_key(item[0]))
+        compat_rows: list[tuple[tuple[int, int, float, tuple[float, float, float, int]], dict[str, object], dict[str, object]]] = []
+        for candidate, match in sorted(rows, key=lambda item: nonoracle_candidate_quality_key(item[0]))[:8]:
+            feasible, active, optimum, _ = lp_candidate_active_against(
+                core_candidates,
+                candidate,
+                inside_tol=max(float(point_tol), 0.03),
+                activity_tol=0.03,
+            )
+            outside = cumulative_outside_metrics(core_candidates + [candidate], trusted_points, trusted_z_indices, point_tol=float(point_tol))
+            outside_frac = finite_float(outside.get("cumulative_outside_fraction"), float("inf"))
+            compat_rows.append(
+                (
+                    (
+                        0 if feasible and active else 1,
+                        int(outside.get("cumulative_lost_z_levels") or 0),
+                        outside_frac,
+                        nonoracle_candidate_quality_key(candidate),
+                    ),
+                    candidate,
+                    match,
+                )
+            )
+        compat_rows.sort(key=lambda item: item[0])
+        selected_specs = [
+            ("oracle_best_geometry", by_geometry[0], by_geometry[1], individual_summary(by_geometry[0])),
+            ("best_nonoracle_quality_among_finite_good", by_quality[0], by_quality[1], individual_summary(by_quality[0])),
+        ]
+        if compat_rows:
+            _, cand, match = compat_rows[0]
+            summary = individual_summary(cand)
+            selected_specs.append(("best_core_compatible_among_finite_good", cand, match, summary))
+            primary_by_face[int(face_id)] = cand
+        seen_ids: set[int] = set()
+        for method, candidate, match, summary in selected_specs:
+            tid = candidate_track_id(candidate)
+            if tid in seen_ids:
+                continue
+            seen_ids.add(tid)
+            row = candidate_diagnostic_row(candidate, match, production_rank_by_id=production_rank_by_id, individual=summary)
+            row["representative_method"] = method
+            representatives.append(row)
+
+    individual_upper_ids = {
+        int(row["face_id"])
+        for row in representatives
+        if bool(row.get("individual_active")) and int(row.get("face_id") or -1) >= 0
+    }
+
+
+    primary_faces = sorted(primary_by_face)
+    pair_rows: list[dict[str, object]] = []
+    conflict_edges: set[tuple[int, int]] = set()
+    degree: dict[int, int] = {int(fid): 0 for fid in primary_faces}
+    conflict_counts: dict[str, int] = {}
+    zone_counts: dict[str, int] = {}
+    inside_tol = max(float(point_tol), 0.03)
+    activity_tol = 0.03
+
+    def pair_classification(fid_a: int, fid_b: int) -> tuple[str, dict[str, object]]:
+        cand_a = primary_by_face[fid_a]
+        cand_b = primary_by_face[fid_b]
+        constraints = lp_constraints_for_candidates(core_candidates + [cand_a, cand_b])
+        feasible_pair, _, status_pair = solve_halfspace_lp(constraints, inside_tol=inside_tol, objective=None)
+        active_a = False
+        active_b = False
+        if feasible_pair:
+            _, active_a, opt_a, _ = lp_candidate_active_against(core_candidates + [cand_b], cand_a, inside_tol=inside_tol, activity_tol=activity_tol)
+            _, active_b, opt_b, _ = lp_candidate_active_against(core_candidates + [cand_a], cand_b, inside_tol=inside_tol, activity_tol=activity_tol)
+        else:
+            opt_a = None
+            opt_b = None
+        outside = {
+            "skipped": True,
+            "reason": "pairwise graph uses LP feasibility/activity only; trusted outside is checked on the collective lower-bound polyhedron",
+        }
+        if not feasible_pair:
+            kind = "infeasible_or_unbounded"
+        elif not active_a and active_b:
+            kind = "B_suppresses_A"
+        elif active_a and not active_b:
+            kind = "A_suppresses_B"
+        elif not active_a and not active_b:
+            kind = "both_become_redundant"
+        else:
+            kind = "mutually_compatible"
+        return kind, {
+            "face_a": int(fid_a),
+            "candidate_a": int(candidate_track_id(cand_a)),
+            "face_b": int(fid_b),
+            "candidate_b": int(candidate_track_id(cand_b)),
+            "type": kind,
+            "feasible": bool(feasible_pair),
+            "lp_status": status_pair,
+            "active_a": bool(active_a),
+            "active_b": bool(active_b),
+            "lp_optimum_a": as_json_float(float(opt_a)) if opt_a is not None else None,
+            "lp_optimum_b": as_json_float(float(opt_b)) if opt_b is not None else None,
+            "retained_core_ids_lp": None,
+            "lost_core_ids_lp_sample": [],
+            "trusted_outside": outside,
+            "zones": sorted({candidate_zone(cand_a), candidate_zone(cand_b)}),
+        }
+
+    for i, fid_a in enumerate(primary_faces):
+        for fid_b in primary_faces[i + 1:]:
+            kind, row = pair_classification(fid_a, fid_b)
+            conflict_counts[kind] = conflict_counts.get(kind, 0) + 1
+            for zone in row["zones"]:
+                zone_counts[str(zone)] = zone_counts.get(str(zone), 0) + 1
+            if kind != "mutually_compatible":
+                edge = (int(fid_a), int(fid_b))
+                conflict_edges.add(edge)
+                degree[int(fid_a)] = degree.get(int(fid_a), 0) + 1
+                degree[int(fid_b)] = degree.get(int(fid_b), 0) + 1
+                if len(pair_rows) < 400:
+                    pair_rows.append(row)
+
+    def greedy_independent(seed_order: list[int]) -> list[int]:
+        chosen: list[int] = []
+        chosen_set: set[int] = set()
+        for fid in seed_order:
+            if all(tuple(sorted((fid, other))) not in conflict_edges for other in chosen_set):
+                chosen.append(int(fid))
+                chosen_set.add(int(fid))
+        return chosen
+
+    quality_order = sorted(primary_faces, key=lambda fid: nonoracle_candidate_quality_key(primary_by_face[fid]))
+    degree_order = sorted(primary_faces, key=lambda fid: (degree.get(fid, 0), nonoracle_candidate_quality_key(primary_by_face[fid])))
+    candidate_sets = [greedy_independent(degree_order), greedy_independent(quality_order)]
+    for fid in degree_order[:12]:
+        seeded = [fid] + [v for v in degree_order if v != fid]
+        candidate_sets.append(greedy_independent(seeded))
+    candidate_sets.sort(key=lambda ids: (-len(ids), sum(degree.get(v, 0) for v in ids), sum(nonoracle_candidate_quality_key(primary_by_face[v])[0] for v in ids)))
+    pairwise_ids = candidate_sets[0] if candidate_sets else []
+
+    def build_summary(face_ids: list[int], prefix: int) -> dict[str, object]:
+        return summarize_reconstruction_prefix(
+            prefix=prefix,
+            candidates=core_candidates + [primary_by_face[fid] for fid in face_ids],
+            core_count=len(core_candidates),
+            core_ids=core_ids,
+            model_faces=model_faces,
+            initial_vertices=initial_vertices,
+            trusted_points=trusted_points,
+            trusted_z_indices=trusted_z_indices,
+            point_tol=float(point_tol),
+            reconstruction_kwargs=reconstruction_kwargs,
+            match_cache=match_cache,
+        )
+
+    feasible_ids = list(pairwise_ids)
+    feasible_summary = build_summary(feasible_ids, len(feasible_ids)) if feasible_ids else build_summary([], 0)
+    removal_log: list[dict[str, object]] = []
+
+    def summary_ok(summary: dict[str, object]) -> bool:
+        outside = summary.get("trusted_outside") if isinstance(summary.get("trusted_outside"), dict) else {}
+        ext = summary.get("topology") if isinstance(summary.get("topology"), dict) else {}
+        return bool(
+            topology_is_valid(ext)
+            and float(outside.get("cumulative_outside_fraction") or 0.0) < 0.01
+            and int(outside.get("cumulative_lost_z_levels") or 0) == 0
+            and int(summary.get("retained_core_ids") or 0) >= 72
+        )
+
+    iterations = 0
+    while feasible_ids and not summary_ok(feasible_summary) and iterations < 20:
+        iterations += 1
+        worst = max(
+            feasible_ids,
+            key=lambda fid: (
+                degree.get(fid, 0),
+                finite_float(primary_by_face[fid].get("w2_support_diverse_score"), 0.0),
+                candidate_track_id(primary_by_face[fid]),
+            ),
+        )
+        feasible_ids = [fid for fid in feasible_ids if fid != worst]
+        feasible_summary = build_summary(feasible_ids, len(feasible_ids))
+        removal_log.append(
+            {
+                "removed_face_id": int(worst),
+                "removed_candidate_id": int(candidate_track_id(primary_by_face[worst])),
+                "remaining_faces": int(len(feasible_ids)),
+                "summary_new_ids": len(feasible_summary.get("new_ids", [])),
+                "summary_retained_core_ids": int(feasible_summary.get("retained_core_ids") or 0),
+                "topology_valid": topology_is_valid(feasible_summary.get("topology") if isinstance(feasible_summary.get("topology"), dict) else None),
+            }
+        )
+
+    oracle_face_set = set(int(v) for v in feasible_summary.get("new_ids", []))
+    fate_rows: list[dict[str, object]] = []
+    accepted_by_face: dict[int, list[int]] = {}
+    for candidate in w2_accepted_candidates:
+        tid = candidate_track_id(candidate)
+        match = match_cache.get(tid)
+        if match is None:
+            match = candidate_oracle_face(candidate, model_faces)
+            match_cache[tid] = match
+        if match is not None and bool(match.get("finite_good")):
+            accepted_by_face.setdefault(int(match["face_id"]), []).append(tid)
+    for face_id in sorted(oracle_face_set):
+        candidate = primary_by_face.get(face_id)
+        if candidate is None:
+            continue
+        tid = candidate_track_id(candidate)
+        if tid in active_ids:
+            fate = "active"
+        elif tid in accepted_ids:
+            fate = "accepted_but_final_inactive"
+        elif accepted_by_face.get(face_id):
+            fate = "different_representative_selected"
+        else:
+            fate = "candidate_absent_from_top_K"
+        fate_rows.append(
+            {
+                "face_id": int(face_id),
+                "oracle_candidate_id": int(tid),
+                "production_fate": fate,
+                "production_rank": production_rank_by_id.get(tid),
+                "accepted_same_face_candidate_ids": accepted_by_face.get(face_id, [])[:6],
+                "candidate_quality_score": candidate.get("w2_support_diverse_score"),
+            }
+        )
+
+    active_matches = []
+    for candidate in w2_active_candidates:
+        tid = candidate_track_id(candidate)
+        match = match_cache.get(tid)
+        if match is None:
+            match = candidate_oracle_face(candidate, model_faces)
+            match_cache[tid] = match
+        active_matches.append((candidate, match))
+    active_false = [
+        candidate_diagnostic_row(c, m, production_rank_by_id=production_rank_by_id, individual=None)
+        for c, m in active_matches
+        if m is None or not bool(m.get("finite_good")) or oracle_match_face_id(m) in core_ids
+    ]
+
+    def objective_summary(candidates_in: list[dict[str, object]]) -> dict[str, object]:
+        groups = {str(c.get("dedupe_cluster_id", candidate_edge_pair(c))) for c in candidates_in}
+        support_count = sum(int(c.get("finite_support_count") or 0) for c in candidates_in)
+        residuals = [finite_float(c.get("finite_support_residual_p95"), float("nan")) for c in candidates_in]
+        densities = [finite_float(c.get("finite_support_density"), float("nan")) for c in candidates_in]
+        return {
+            "candidate_count": int(len(candidates_in)),
+            "distinct_plane_patch_groups": int(len(groups)),
+            "total_finite_support_count": int(support_count),
+            "support_density": distribution_summary(densities),
+            "support_residual_p95": distribution_summary(residuals),
+            "mean_quality_score": as_json_float(float(np.mean([finite_float(c.get("w2_support_diverse_score"), 0.0) for c in candidates_in]))) if candidates_in else None,
+        }
+
+    oracle_candidates = [primary_by_face[fid] for fid in sorted(oracle_face_set) if fid in primary_by_face]
+    return {
+        "terminology": {
+            "individual_upper_bound": "new canonical face IDs with at least one individually active finite-good candidate",
+            "pairwise_graph_bound": "bounded LP pairwise-compatible primary representatives; not a proof of global optimum",
+            "oracle_achieved_lower_bound": "real edge-clip polyhedron built from the selected oracle representatives",
+            "proven_optimum": None,
+        },
+        "representative_pool": {
+            "new_face_ids_with_finite_good_preselection": int(len(finite_by_face)),
+            "representatives_total": int(len(representatives)),
+            "representatives_sample": representatives[:180],
+        },
+        "individual_upper_bound": {
+            "new_face_count": int(len(individual_upper_ids)),
+            "face_ids_sample": sorted(int(v) for v in individual_upper_ids)[:160],
+        },
+        "pairwise_conflict_graph": {
+            "vertex_face_count": int(len(primary_faces)),
+            "primary_representative_count": int(len(primary_faces)),
+            "pair_count": int(len(primary_faces) * (len(primary_faces) - 1) // 2),
+            "conflict_edge_count": int(len(conflict_edges)),
+            "classification_counts": conflict_counts,
+            "degree": {
+                "min": int(min(degree.values())) if degree else 0,
+                "median": as_json_float(float(np.median(list(degree.values())))) if degree else None,
+                "p90": as_json_float(float(np.percentile(list(degree.values()), 90))) if degree else None,
+                "max": int(max(degree.values())) if degree else 0,
+            },
+            "most_conflictive_faces": [
+                {
+                    "face_id": int(fid),
+                    "degree": int(degree.get(fid, 0)),
+                    "candidate_id": int(candidate_track_id(primary_by_face[fid])),
+                    "zone": candidate_zone(primary_by_face[fid]),
+                }
+                for fid in sorted(primary_faces, key=lambda v: (-degree.get(v, 0), v))[:20]
+            ],
+            "zone_counts": zone_counts,
+            "conflict_rows_sample": pair_rows,
+        },
+        "pairwise_graph_bound": {
+            "method": "deterministic greedy independent-set lower bound on LP pairwise graph; not proven optimum",
+            "selected_new_face_ids": sorted(int(v) for v in pairwise_ids),
+            "selected_new_face_count": int(len(pairwise_ids)),
+        },
+        "oracle_achieved_lower_bound": {
+            "selected_new_face_ids": sorted(int(v) for v in oracle_face_set),
+            "selected_candidate_ids": [
+                int(candidate_track_id(primary_by_face[fid]))
+                for fid in sorted(oracle_face_set)
+                if fid in primary_by_face
+            ],
+            "selected_new_face_count": int(len(oracle_face_set)),
+            "removal_log": removal_log,
+            "summary": feasible_summary,
+        },
+        "production_gap": {
+            "production_active_new_ids": sorted(
+                int(m["face_id"])
+                for _, m in active_matches
+                if m is not None and bool(m.get("finite_good")) and oracle_match_face_id(m) not in core_ids
+            ),
+            "oracle_faces_missing_from_active": sorted(int(v) for v in (oracle_face_set - {
+                int(m["face_id"])
+                for _, m in active_matches
+                if m is not None and bool(m.get("finite_good")) and oracle_match_face_id(m) not in core_ids
+            })),
+            "fate_rows": fate_rows,
+            "active_false_or_duplicate_sample": active_false[:120],
+        },
+        "nonoracle_objective_audit": {
+            "production_active_w2": objective_summary(w2_active_candidates),
+            "oracle_lower_bound_candidates": objective_summary(oracle_candidates),
+            "interpretation": (
+                "The aggregate observed-support objective is diagnostic-only; it is not used for production acceptance "
+                "and does not prove a safe exchange rule without controlled replacement trials."
+            ),
+        },
+    }
 
 
 def model_edges_from_faces(vertices: np.ndarray, faces: list[list[int]]) -> tuple[list[tuple[int, int]], dict[tuple[int, int], set[int]]]:
