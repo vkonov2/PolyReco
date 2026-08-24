@@ -29,16 +29,12 @@ from match_full_circle_points_to_edges import (
 from polyreco.rms_oracle_loss_diagnostics import (
     REQUIRED_RUNTIME_SYMBOLS as ORACLE_LOSS_DIAGNOSTIC_RUNTIME_SYMBOLS,
     bind_runtime_symbols as bind_oracle_loss_diagnostic_runtime_symbols,
+    dispatch_final_mesh_named_oracle_scope,
     dispatch_post_multiscale_oracle_scope,
     dispatch_post_w2_oracle_scope,
     diagnose_candidate_formation_failures,
-    diagnose_active_plane_pruning_corrected,
-    diagnose_current_candidate_exchange,
-    diagnose_edge_incidence_raw_support,
-    diagnose_view_conditioned_raw_support,
     diagnose_preselection_safe_reservoir,
     diagnose_production_129_loss_funnel,
-    observed_symmetry_diagnostics,
 )
 from polyreco.rms_output import build_payload, build_viewer_html
 
@@ -16595,221 +16591,37 @@ def main() -> None:
             match_cache=oracle_match_cache,
         )
 
-    if (
-        str(args.dense_detector_mode) == "w2-edge-tracks"
-        and not bool(args.disable_oracle_diagnostics)
-        and oracle_diagnostic_scope == "current-candidate-exchange"
-    ):
-        oracle_diagnostics_started = time.perf_counter()
-        target_face_ids_by_model = {
-            "pear": [107, 113, 118, 120, 122, 125, 130, 150, 196, 214],
-            "cushion": [0, 3, 20, 119, 218, 256, 285],
-        }
-        target_face_ids = target_face_ids_by_model.get(str(model_name), [])
-        baseline_payload = None
-        baseline_json_path = os.environ.get("POLYRECO_CURRENT_CANDIDATE_EXCHANGE_BASELINE_JSON")
-        if baseline_json_path:
-            try:
-                baseline_payload = json.loads(Path(baseline_json_path).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                baseline_payload = {"_load_error": repr(exc), "_path": str(baseline_json_path)}
-        exchange_output = Path(
-            os.environ.get(
-                "POLYRECO_CURRENT_CANDIDATE_EXCHANGE_OUTPUT_JSON",
-                f"/private/tmp/{model_name}_current_candidate_exchange.json",
-            )
-        )
-        model_face_rows = model_face_planes(vertices, model.faces)
-        oracle_reconstruction_kwargs = {
-            "halfspace_slack": float(args.intersection_halfspace_slack),
-            "feasibility_tol": float(args.intersection_feasibility_tol),
-            "incidence_tol": float(args.intersection_incidence_tol),
-            "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
-            "min_face_area": float(args.intersection_min_face_area),
-            "triple_det_tol": float(args.intersection_triple_det_tol),
-            "prune_redundant": bool(args.intersection_prune_redundant_planes),
-            "redundancy_tol": float(args.intersection_redundancy_tol),
-        }
-        exchange_payload = diagnose_current_candidate_exchange(
+    named_oracle_diagnostics = None
+    named_oracle_diagnostics_started = None
+    if str(args.dense_detector_mode) == "w2-edge-tracks" and not bool(args.disable_oracle_diagnostics):
+        named_oracle_diagnostics_started = time.perf_counter()
+        named_oracle_diagnostics = dispatch_final_mesh_named_oracle_scope(
+            scope=oracle_diagnostic_scope,
+            args=args,
             model_name=model_name,
             vertices=vertices,
-            model_faces=model_face_rows,
+            faces=model.faces,
             final_candidates=candidates,
             final_reconstructed=reconstructed,
             trusted_points=trusted_cloud_points,
             trusted_z_indices=trusted_cloud_z_indices,
-            point_tol=float(args.compatibility_point_tol),
-            reconstruction_kwargs=oracle_reconstruction_kwargs,
-            contours=contours,
-            target_face_ids=target_face_ids,
-            baseline_payload=baseline_payload,
-            max_full_trials=30,
+            windows=windows,
+            z_levels=z_levels,
+            line_points_by_window=line_points_by_window,
+            fit_rms_by_window=fit_rms_by_window,
+            cond_by_window=cond_by_window,
+            point_bounds_min=point_bounds_min,
+            point_bounds_max=point_bounds_max,
+            w2_segments=dense_w2_segments,
+            w2_clusters=dense_w2_edge_clusters,
+            core_candidates=dense_core_candidates,
+            preselection_reservoir_audit=run_current_preselection_reservoir_audit,
         )
-        exchange_payload["diagnostic_output_path"] = str(exchange_output)
-        exchange_payload["baseline_json_path"] = baseline_json_path
-        exchange_output.parent.mkdir(parents=True, exist_ok=True)
-        exchange_output.write_text(
-            json.dumps(exchange_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+    if named_oracle_diagnostics is not None:
+        dense_detector_summary["oracle_diagnostics"] = named_oracle_diagnostics
+        pipeline_timing["oracle_diagnostics_seconds"] += (
+            time.perf_counter() - float(named_oracle_diagnostics_started)
         )
-        dense_detector_summary["oracle_diagnostics"] = {
-            "diagnostic_scope": {
-                "name": "current-candidate-exchange",
-                "production_read_only": True,
-                "uses_initial_model": "oracle-seeded target cohort and posthoc canonical labels only",
-                "compact_output_path": str(exchange_output),
-                "recomputed_blocks": ["current_candidate_exchange"],
-            },
-            "current_candidate_exchange": exchange_payload,
-        }
-        pipeline_timing["oracle_diagnostics_seconds"] += time.perf_counter() - oracle_diagnostics_started
-        print(
-            "current-candidate-exchange model={model} targets={targets} trials={trials} output={output}".format(
-                model=model_name,
-                targets=len(target_face_ids),
-                trials=int((exchange_payload.get("full_edge_clip_trials") or {}).get("trial_count") or 0),
-                output=exchange_output,
-            )
-        )
-    elif (
-        str(args.dense_detector_mode) == "w2-edge-tracks"
-        and not bool(args.disable_oracle_diagnostics)
-        and oracle_diagnostic_scope == "edge-incidence-raw-support"
-    ):
-        oracle_diagnostics_started = time.perf_counter()
-        model_face_rows = model_face_planes(vertices, model.faces)
-        dense_detector_summary["oracle_diagnostics"] = {
-            "diagnostic_scope": {
-                "name": "edge-incidence-raw-support",
-                "production_read_only": True,
-                "uses_initial_model": "posthoc edge labels/ceiling evaluation only",
-                "recomputed_blocks": ["edge_incidence_raw_support"],
-                "full_edge_clip_trials": "not run unless the diagnostic produces a production-ready non-oracle shortlist",
-            },
-            "edge_incidence_raw_support": diagnose_edge_incidence_raw_support(
-                model_name=model_name,
-                vertices=vertices,
-                faces=model.faces,
-                windows=windows,
-                z_levels=z_levels,
-                line_points_by_window=line_points_by_window,
-                fit_rms_by_window=fit_rms_by_window,
-                cond_by_window=cond_by_window,
-                point_bounds_min=point_bounds_min,
-                point_bounds_max=point_bounds_max,
-                peak_threshold=float(args.peak_threshold),
-                low_threshold=float(args.low_threshold),
-                final_candidates=candidates,
-                final_reconstructed=reconstructed,
-                w2_segments=dense_w2_segments,
-                w2_clusters=dense_w2_edge_clusters,
-                model_faces=model_face_rows,
-            ),
-        }
-        pipeline_timing["oracle_diagnostics_seconds"] += time.perf_counter() - oracle_diagnostics_started
-    elif (
-        str(args.dense_detector_mode) == "w2-edge-tracks"
-        and not bool(args.disable_oracle_diagnostics)
-        and oracle_diagnostic_scope == "view-conditioned-raw-support"
-    ):
-        oracle_diagnostics_started = time.perf_counter()
-        model_face_rows = model_face_planes(vertices, model.faces)
-        dense_detector_summary["oracle_diagnostics"] = {
-            "diagnostic_scope": {
-                "name": "view-conditioned-raw-support",
-                "production_read_only": True,
-                "uses_initial_model": "posthoc labels/evaluation only",
-                "recomputed_blocks": ["view_conditioned_raw_support"],
-                "full_edge_clip_trials": "not run unless the diagnostic produces a production-ready non-oracle shortlist",
-            },
-            "view_conditioned_raw_support": diagnose_view_conditioned_raw_support(
-                model_name=model_name,
-                vertices=vertices,
-                faces=model.faces,
-                windows=windows,
-                z_levels=z_levels,
-                line_points_by_window=line_points_by_window,
-                fit_rms_by_window=fit_rms_by_window,
-                cond_by_window=cond_by_window,
-                point_bounds_min=point_bounds_min,
-                point_bounds_max=point_bounds_max,
-                peak_threshold=float(args.peak_threshold),
-                low_threshold=float(args.low_threshold),
-                final_candidates=candidates,
-                final_reconstructed=reconstructed,
-                model_faces=model_face_rows,
-            ),
-        }
-        pipeline_timing["oracle_diagnostics_seconds"] += time.perf_counter() - oracle_diagnostics_started
-    elif (
-        str(args.dense_detector_mode) == "w2-edge-tracks"
-        and not bool(args.disable_oracle_diagnostics)
-        and oracle_diagnostic_scope == "preselection-safe-reservoir"
-    ):
-        oracle_diagnostics_started = time.perf_counter()
-        previous_json = json.loads(Path(args.output_json).read_text())
-        cached_oracle = ((previous_json.get("parameters") or {}).get("oracle_diagnostics") or {})
-        cached_loss_funnel = cached_oracle.get("production_129_loss_funnel")
-        if not isinstance(cached_loss_funnel, dict):
-            raise RuntimeError(
-                "POLYRECO_ORACLE_DIAGNOSTIC_SCOPE=preselection-safe-reservoir requires an existing "
-                "production_129_loss_funnel in --output-json"
-            )
-        model_face_rows = model_face_planes(vertices, model.faces)
-        core_reconstructed = reconstruct_polyhedron_from_halfspaces_edge_clip(
-            dense_core_candidates,
-            halfspace_slack=float(args.intersection_halfspace_slack),
-            feasibility_tol=float(args.intersection_feasibility_tol),
-            incidence_tol=float(args.intersection_incidence_tol),
-            vertex_merge_tol=float(args.intersection_vertex_merge_tol),
-            min_face_area=float(args.intersection_min_face_area),
-            triple_det_tol=float(args.intersection_triple_det_tol),
-            prune_redundant=bool(args.intersection_prune_redundant_planes),
-            redundancy_tol=float(args.intersection_redundancy_tol),
-        )
-        core_only_active_indices = [
-            int(index)
-            for index in core_reconstructed.get("face_candidate_indices", [])
-            if 0 <= int(index) < len(dense_core_candidates)
-        ]
-        core_only_active_candidates = [dense_core_candidates[index] for index in core_only_active_indices]
-        oracle_match_cache: dict[int, dict[str, object] | None] = {}
-        core_cohort = oracle_candidate_cohort(
-            core_only_active_candidates,
-            model_face_rows,
-            active_plane_indices=core_only_active_indices,
-            match_cache=oracle_match_cache,
-        )
-        core_ids = set(int(value) for value in core_cohort.get("finite_face_ids", []))
-        oracle_reconstruction_kwargs = {
-            "halfspace_slack": float(args.intersection_halfspace_slack),
-            "feasibility_tol": float(args.intersection_feasibility_tol),
-            "incidence_tol": float(args.intersection_incidence_tol),
-            "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
-            "min_face_area": float(args.intersection_min_face_area),
-            "triple_det_tol": float(args.intersection_triple_det_tol),
-            "prune_redundant": bool(args.intersection_prune_redundant_planes),
-            "redundancy_tol": float(args.intersection_redundancy_tol),
-        }
-        cached_loss_funnel["preselection_safe_reservoir_audit"] = run_current_preselection_reservoir_audit(
-            cached_loss_funnel=cached_loss_funnel,
-            model_face_rows=model_face_rows,
-            core_reconstructed=core_reconstructed,
-            core_ids=core_ids,
-            oracle_reconstruction_kwargs=oracle_reconstruction_kwargs,
-            oracle_match_cache=oracle_match_cache,
-        )
-        cached_oracle["production_129_loss_funnel"] = cached_loss_funnel
-        cached_oracle["diagnostic_scope"] = {
-            "name": "preselection-safe-reservoir",
-            "reused_existing_oracle_diagnostics": True,
-            "recomputed_blocks": [
-                "production_129_loss_funnel.preselection_safe_reservoir_audit",
-            ],
-            "w2_short_edge_diagnostics_rerun": False,
-        }
-        dense_detector_summary["oracle_diagnostics"] = cached_oracle
-        pipeline_timing["oracle_diagnostics_seconds"] += time.perf_counter() - oracle_diagnostics_started
     elif str(args.dense_detector_mode) == "w2-edge-tracks" and not bool(args.disable_oracle_diagnostics):
         oracle_diagnostics_started = time.perf_counter()
         model_face_rows = model_face_planes(vertices, model.faces)

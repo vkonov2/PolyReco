@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -467,6 +467,156 @@ def dispatch_post_w2_oracle_scope(
         )
         return True
     return False
+
+
+def dispatch_final_mesh_named_oracle_scope(
+    *,
+    scope: str,
+    args: object,
+    model_name: str,
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    final_candidates: list[dict[str, object]],
+    final_reconstructed: dict[str, object],
+    trusted_points: np.ndarray,
+    trusted_z_indices: np.ndarray,
+    windows: list[int],
+    z_levels: np.ndarray,
+    line_points_by_window: np.ndarray,
+    fit_rms_by_window: np.ndarray,
+    cond_by_window: np.ndarray,
+    point_bounds_min: np.ndarray,
+    point_bounds_max: np.ndarray,
+    w2_segments: list[dict[str, object]],
+    w2_clusters: list[dict[str, object]],
+    core_candidates: list[dict[str, object]],
+    preselection_reservoir_audit: Callable[..., dict[str, object]],
+) -> dict[str, object] | None:
+    if scope == "edge-incidence-raw-support":
+        model_face_rows = model_face_planes(vertices, faces)
+        return {
+            "diagnostic_scope": {
+                "name": "edge-incidence-raw-support",
+                "production_read_only": True,
+                "uses_initial_model": "posthoc edge labels/ceiling evaluation only",
+                "recomputed_blocks": ["edge_incidence_raw_support"],
+                "full_edge_clip_trials": "not run unless the diagnostic produces a production-ready non-oracle shortlist",
+            },
+            "edge_incidence_raw_support": diagnose_edge_incidence_raw_support(
+                model_name=model_name,
+                vertices=vertices,
+                faces=faces,
+                windows=windows,
+                z_levels=z_levels,
+                line_points_by_window=line_points_by_window,
+                fit_rms_by_window=fit_rms_by_window,
+                cond_by_window=cond_by_window,
+                point_bounds_min=point_bounds_min,
+                point_bounds_max=point_bounds_max,
+                peak_threshold=float(args.peak_threshold),
+                low_threshold=float(args.low_threshold),
+                final_candidates=final_candidates,
+                final_reconstructed=final_reconstructed,
+                w2_segments=w2_segments,
+                w2_clusters=w2_clusters,
+                model_faces=model_face_rows,
+            ),
+        }
+
+    if scope == "view-conditioned-raw-support":
+        model_face_rows = model_face_planes(vertices, faces)
+        return {
+            "diagnostic_scope": {
+                "name": "view-conditioned-raw-support",
+                "production_read_only": True,
+                "uses_initial_model": "posthoc labels/evaluation only",
+                "recomputed_blocks": ["view_conditioned_raw_support"],
+                "full_edge_clip_trials": "not run unless the diagnostic produces a production-ready non-oracle shortlist",
+            },
+            "view_conditioned_raw_support": diagnose_view_conditioned_raw_support(
+                model_name=model_name,
+                vertices=vertices,
+                faces=faces,
+                windows=windows,
+                z_levels=z_levels,
+                line_points_by_window=line_points_by_window,
+                fit_rms_by_window=fit_rms_by_window,
+                cond_by_window=cond_by_window,
+                point_bounds_min=point_bounds_min,
+                point_bounds_max=point_bounds_max,
+                peak_threshold=float(args.peak_threshold),
+                low_threshold=float(args.low_threshold),
+                final_candidates=final_candidates,
+                final_reconstructed=final_reconstructed,
+                model_faces=model_face_rows,
+            ),
+        }
+
+    if scope == "preselection-safe-reservoir":
+        previous_json = json.loads(Path(args.output_json).read_text())
+        cached_oracle = ((previous_json.get("parameters") or {}).get("oracle_diagnostics") or {})
+        cached_loss_funnel = cached_oracle.get("production_129_loss_funnel")
+        if not isinstance(cached_loss_funnel, dict):
+            raise RuntimeError(
+                "POLYRECO_ORACLE_DIAGNOSTIC_SCOPE=preselection-safe-reservoir requires an existing "
+                "production_129_loss_funnel in --output-json"
+            )
+        model_face_rows = model_face_planes(vertices, faces)
+        core_reconstructed = reconstruct_polyhedron_from_halfspaces_edge_clip(
+            core_candidates,
+            halfspace_slack=float(args.intersection_halfspace_slack),
+            feasibility_tol=float(args.intersection_feasibility_tol),
+            incidence_tol=float(args.intersection_incidence_tol),
+            vertex_merge_tol=float(args.intersection_vertex_merge_tol),
+            min_face_area=float(args.intersection_min_face_area),
+            triple_det_tol=float(args.intersection_triple_det_tol),
+            prune_redundant=bool(args.intersection_prune_redundant_planes),
+            redundancy_tol=float(args.intersection_redundancy_tol),
+        )
+        core_only_active_indices = [
+            int(index)
+            for index in core_reconstructed.get("face_candidate_indices", [])
+            if 0 <= int(index) < len(core_candidates)
+        ]
+        core_only_active_candidates = [core_candidates[index] for index in core_only_active_indices]
+        oracle_match_cache: dict[int, dict[str, object] | None] = {}
+        core_cohort = oracle_candidate_cohort(
+            core_only_active_candidates,
+            model_face_rows,
+            active_plane_indices=core_only_active_indices,
+            match_cache=oracle_match_cache,
+        )
+        core_ids = set(int(value) for value in core_cohort.get("finite_face_ids", []))
+        reconstruction_kwargs = {
+            "halfspace_slack": float(args.intersection_halfspace_slack),
+            "feasibility_tol": float(args.intersection_feasibility_tol),
+            "incidence_tol": float(args.intersection_incidence_tol),
+            "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
+            "min_face_area": float(args.intersection_min_face_area),
+            "triple_det_tol": float(args.intersection_triple_det_tol),
+            "prune_redundant": bool(args.intersection_prune_redundant_planes),
+            "redundancy_tol": float(args.intersection_redundancy_tol),
+        }
+        cached_loss_funnel["preselection_safe_reservoir_audit"] = preselection_reservoir_audit(
+            cached_loss_funnel=cached_loss_funnel,
+            model_face_rows=model_face_rows,
+            core_reconstructed=core_reconstructed,
+            core_ids=core_ids,
+            oracle_reconstruction_kwargs=reconstruction_kwargs,
+            oracle_match_cache=oracle_match_cache,
+        )
+        cached_oracle["production_129_loss_funnel"] = cached_loss_funnel
+        cached_oracle["diagnostic_scope"] = {
+            "name": "preselection-safe-reservoir",
+            "reused_existing_oracle_diagnostics": True,
+            "recomputed_blocks": [
+                "production_129_loss_funnel.preselection_safe_reservoir_audit",
+            ],
+            "w2_short_edge_diagnostics_rerun": False,
+        }
+        return cached_oracle
+
+    return None
 
 
 def diagnose_production_129_loss_funnel(
