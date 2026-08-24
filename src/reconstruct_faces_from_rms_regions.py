@@ -32,9 +32,6 @@ from polyreco.rms_oracle_loss_diagnostics import (
     diagnose_candidate_formation_failures,
     diagnose_preselection_safe_reservoir,
     diagnose_production_129_loss_funnel,
-    diagnose_w2_adjacency_failures,
-    diagnose_w2_cluster_formation_failures,
-    diagnose_w2_raw_signal_failures,
 )
 from polyreco.rms_output import build_payload, build_viewer_html
 
@@ -1603,38 +1600,6 @@ def candidate_hull_centroid(candidate: dict[str, object]) -> np.ndarray | None:
             return point
         return None
     return np.mean(hull, axis=0)
-
-
-def point_segment_distance_2d(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
-    ab = b - a
-    denom = float(ab @ ab)
-    if denom <= EPS:
-        return float(np.linalg.norm(p - a))
-    t = np.clip(float((p - a) @ ab) / denom, 0.0, 1.0)
-    return float(np.linalg.norm(p - (a + t * ab)))
-
-
-def point_polygon_signed_distance_2d(point: np.ndarray, polygon: np.ndarray) -> float:
-    if polygon.ndim != 2 or polygon.shape[0] < 3:
-        return float("inf")
-    x = float(point[0])
-    y = float(point[1])
-    inside = False
-    j = polygon.shape[0] - 1
-    for i in range(polygon.shape[0]):
-        xi, yi = float(polygon[i, 0]), float(polygon[i, 1])
-        xj, yj = float(polygon[j, 0]), float(polygon[j, 1])
-        crosses = (yi > y) != (yj > y)
-        if crosses:
-            x_cross = (xj - xi) * (y - yi) / (yj - yi + 1e-300) + xi
-            if x < x_cross:
-                inside = not inside
-        j = i
-    edge_dist = min(
-        point_segment_distance_2d(point, polygon[i], polygon[(i + 1) % polygon.shape[0]])
-        for i in range(polygon.shape[0])
-    )
-    return -float(edge_dist) if inside else float(edge_dist)
 
 
 def polygon_signed_distances_2d(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
