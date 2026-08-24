@@ -246,7 +246,7 @@ uv run python src/reconstruct_faces_from_rms_regions.py --model round --no-progr
 Текущие важные дефолты:
 
 ```text
---windows 4,6,8,10,12,16,20,24,28
+--windows 3,4,6
 --peak-threshold 0.00055
 --low-threshold 0.0002
 --peak-quantile -1.0
@@ -264,6 +264,25 @@ uv run python src/reconstruct_faces_from_rms_regions.py --model round --no-progr
 --intersection-inside-tol 0.03
 --intersection-vertex-tol 0.02
 ```
+
+Широкий набор окон `4,6,8,10,12,16,20,24,28` остается доступен как explicit CLI value для отдельных сравнений, но не является дефолтом validated reconstruction pipeline.
+
+Каноническая packaging/freeze команда для воспроизводимого cross-model benchmark summary без нового пересчета reconstruction:
+
+```bash
+uv run python src/benchmark_reconstruction_quality.py \
+  --input-json output/round_rms_w2_edge_tracks.json \
+  --input-json /private/tmp/princess_angular_final_off.json \
+  --input-json /private/tmp/radiant_angular_off_control.json \
+  --input-json /private/tmp/pear_angular_balanced_off.json \
+  --input-json /private/tmp/cushion_angular_off_control.json \
+  --freeze-metadata-from output/rms_cross_model_angular_benchmark.json \
+  --freeze-only \
+  --output-json output/rms_cross_model_angular_benchmark.json \
+  --output-html output/rms_cross_model_angular_benchmark.html
+```
+
+Обычный rerun benchmark evaluator не должен молча перезаписывать JSON, содержащий freeze metadata; для packaging/freeze использовать явный `--freeze-metadata-from`.
 
 Последний результат для `round`:
 
