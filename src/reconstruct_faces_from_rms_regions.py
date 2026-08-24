@@ -29,6 +29,7 @@ from match_full_circle_points_to_edges import (
 from polyreco.rms_oracle_loss_diagnostics import (
     REQUIRED_RUNTIME_SYMBOLS as ORACLE_LOSS_DIAGNOSTIC_RUNTIME_SYMBOLS,
     bind_runtime_symbols as bind_oracle_loss_diagnostic_runtime_symbols,
+    dispatch_post_multiscale_oracle_scope,
     diagnose_candidate_formation_failures,
     diagnose_active_plane_pruning_corrected,
     diagnose_current_candidate_exchange,
@@ -18034,232 +18035,18 @@ def main() -> None:
         trusted_cloud_summary = {
             "trusted_cloud": trusted_cloud["diagnostics"],
         }
-        early_oracle_diagnostic_scope = str(os.environ.get("POLYRECO_ORACLE_DIAGNOSTIC_SCOPE") or "").strip()
-        if early_oracle_diagnostic_scope == "current-candidate-exchange":
-            baseline_json_path = os.environ.get("POLYRECO_CURRENT_CANDIDATE_EXCHANGE_BASELINE_JSON")
-            if not baseline_json_path:
-                raise RuntimeError(
-                    "POLYRECO_ORACLE_DIAGNOSTIC_SCOPE=current-candidate-exchange requires "
-                    "POLYRECO_CURRENT_CANDIDATE_EXCHANGE_BASELINE_JSON"
-                )
-            try:
-                baseline_payload = json.loads(Path(baseline_json_path).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"failed to read current-candidate exchange baseline JSON {baseline_json_path!r}: {exc!r}"
-                ) from exc
-            baseline_candidates = [
-                candidate for candidate in baseline_payload.get("face_candidates", [])
-                if isinstance(candidate, dict)
-            ]
-            baseline_reconstructed = baseline_payload.get("reconstructed")
-            if not baseline_candidates or not isinstance(baseline_reconstructed, dict):
-                raise RuntimeError(
-                    "current-candidate exchange baseline JSON must contain face_candidates and reconstructed"
-                )
-            target_face_ids_by_model = {
-                "pear": [107, 113, 118, 120, 122, 125, 130, 150, 196, 214],
-                "cushion": [0, 3, 20, 119, 218, 256, 285],
-            }
-            exchange_output = Path(
-                os.environ.get(
-                    "POLYRECO_CURRENT_CANDIDATE_EXCHANGE_OUTPUT_JSON",
-                    f"/private/tmp/{model_name}_current_candidate_exchange.json",
-                )
-            )
-            diagnostic_payload = diagnose_current_candidate_exchange(
-                model_name=model_name,
-                vertices=vertices,
-                model_faces=model_face_planes(vertices, model.faces),
-                final_candidates=baseline_candidates,
-                final_reconstructed=baseline_reconstructed,
-                trusted_points=trusted_cloud_points,
-                trusted_z_indices=trusted_cloud_z_indices,
-                point_tol=float(args.compatibility_point_tol),
-                reconstruction_kwargs={
-                    "halfspace_slack": float(args.intersection_halfspace_slack),
-                    "feasibility_tol": float(args.intersection_feasibility_tol),
-                    "incidence_tol": float(args.intersection_incidence_tol),
-                    "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
-                    "min_face_area": float(args.intersection_min_face_area),
-                    "triple_det_tol": float(args.intersection_triple_det_tol),
-                    "prune_redundant": bool(args.intersection_prune_redundant_planes),
-                    "redundancy_tol": float(args.intersection_redundancy_tol),
-                },
-                contours=contours,
-                target_face_ids=target_face_ids_by_model.get(str(model_name), []),
-                baseline_payload=baseline_payload,
-                max_full_trials=30,
-            )
-            diagnostic_payload["diagnostic_output_path"] = str(exchange_output)
-            diagnostic_payload["baseline_json_path"] = baseline_json_path
-            diagnostic_payload["fast_path"] = "baseline_final_state_plus_in_process_trusted_cloud_before_selection"
-            exchange_output.parent.mkdir(parents=True, exist_ok=True)
-            exchange_output.write_text(
-                json.dumps(diagnostic_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            print(
-                "current-candidate-exchange model={model} targets={targets} trials={trials} output={output}".format(
-                    model=model_name,
-                    targets=len(target_face_ids_by_model.get(str(model_name), [])),
-                    trials=int((diagnostic_payload.get("full_edge_clip_trials") or {}).get("trial_count") or 0),
-                    output=exchange_output,
-                )
-            )
-            return
-        if early_oracle_diagnostic_scope == "observed-symmetry-orbit-audit":
-            baseline_json_path = os.environ.get("POLYRECO_SYMMETRY_ORBIT_BASELINE_JSON")
-            if not baseline_json_path:
-                raise RuntimeError(
-                    "POLYRECO_ORACLE_DIAGNOSTIC_SCOPE=observed-symmetry-orbit-audit requires "
-                    "POLYRECO_SYMMETRY_ORBIT_BASELINE_JSON"
-                )
-            try:
-                baseline_payload = json.loads(Path(baseline_json_path).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"failed to read symmetry orbit baseline JSON {baseline_json_path!r}: {exc!r}"
-                ) from exc
-            baseline_candidates = [
-                candidate for candidate in baseline_payload.get("face_candidates", [])
-                if isinstance(candidate, dict)
-            ]
-            baseline_reconstructed = baseline_payload.get("reconstructed")
-            if not baseline_candidates or not isinstance(baseline_reconstructed, dict):
-                raise RuntimeError(
-                    "symmetry orbit baseline JSON must contain face_candidates and reconstructed"
-                )
-            symmetry_output = Path(
-                os.environ.get(
-                    "POLYRECO_SYMMETRY_ORBIT_OUTPUT_JSON",
-                    f"/private/tmp/{model_name}_symmetry_orbit_audit.json",
-                )
-            )
-            diagnostic_payload = observed_symmetry_diagnostics(
-                model_name=model_name,
-                vertices=vertices,
-                model_faces=model_face_planes(vertices, model.faces),
-                final_candidates=baseline_candidates,
-                candidate_pool=all_candidates,
-                final_reconstructed=baseline_reconstructed,
-                trusted_points=trusted_cloud_points,
-                trusted_z_indices=trusted_cloud_z_indices,
-                point_tol=float(args.compatibility_point_tol),
-                reconstruction_kwargs={
-                    "halfspace_slack": float(args.intersection_halfspace_slack),
-                    "feasibility_tol": float(args.intersection_feasibility_tol),
-                    "incidence_tol": float(args.intersection_incidence_tol),
-                    "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
-                    "min_face_area": float(args.intersection_min_face_area),
-                    "triple_det_tol": float(args.intersection_triple_det_tol),
-                    "prune_redundant": bool(args.intersection_prune_redundant_planes),
-                    "redundancy_tol": float(args.intersection_redundancy_tol),
-                },
-                contours=contours,
-                baseline_payload=baseline_payload,
-                baseline_json_path=str(baseline_json_path),
-                max_existing_trials=int(os.environ.get("POLYRECO_SYMMETRY_ORBIT_MAX_EXISTING_TRIALS", "15")),
-                max_synthetic_trials=int(os.environ.get("POLYRECO_SYMMETRY_ORBIT_MAX_SYNTHETIC_TRIALS", "10")),
-            )
-            diagnostic_payload["diagnostic_output_path"] = str(symmetry_output)
-            diagnostic_payload["fast_path"] = "baseline_final_state_plus_in_process_stable_two_scales_trusted_cloud_before_selection"
-            symmetry_output.parent.mkdir(parents=True, exist_ok=True)
-            symmetry_output.write_text(
-                json.dumps(diagnostic_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            existing_trials = diagnostic_payload.get("existing_candidate_orbit_completion") if isinstance(diagnostic_payload.get("existing_candidate_orbit_completion"), dict) else {}
-            synthetic_trials = diagnostic_payload.get("synthetic_transformed_hypotheses") if isinstance(diagnostic_payload.get("synthetic_transformed_hypotheses"), dict) else {}
-            print(
-                "observed-symmetry-orbit-audit model={model} existing_trials={existing} synthetic_trials={synthetic} output={output}".format(
-                    model=model_name,
-                    existing=int(existing_trials.get("trial_count") or 0),
-                    synthetic=int(synthetic_trials.get("trial_count") or 0),
-                    output=symmetry_output,
-                )
-            )
-            return
-        if early_oracle_diagnostic_scope == "active-plane-pruning-corrected":
-            baseline_json_path = os.environ.get("POLYRECO_ACTIVE_PLANE_PRUNING_BASELINE_JSON")
-            if not baseline_json_path:
-                raise RuntimeError(
-                    "POLYRECO_ORACLE_DIAGNOSTIC_SCOPE=active-plane-pruning-corrected requires "
-                    "POLYRECO_ACTIVE_PLANE_PRUNING_BASELINE_JSON"
-                )
-            try:
-                baseline_payload = json.loads(Path(baseline_json_path).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"failed to read active-plane pruning baseline JSON {baseline_json_path!r}: {exc!r}"
-                ) from exc
-            baseline_candidates = [
-                candidate for candidate in baseline_payload.get("face_candidates", [])
-                if isinstance(candidate, dict)
-            ]
-            baseline_reconstructed = baseline_payload.get("reconstructed")
-            if not baseline_candidates or not isinstance(baseline_reconstructed, dict):
-                raise RuntimeError(
-                    "active-plane pruning baseline JSON must contain face_candidates and reconstructed"
-                )
-            previous_pruning_json_path = os.environ.get(
-                "POLYRECO_ACTIVE_PLANE_PRUNING_PROPOSAL_JSON",
-                f"/private/tmp/{model_name}_active_plane_pruning.json",
-            )
-            previous_pruning_payload: dict[str, object] | None = None
-            if previous_pruning_json_path:
-                try:
-                    previous_pruning_payload = json.loads(Path(previous_pruning_json_path).read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    previous_pruning_payload = None
-            pruning_output = Path(
-                os.environ.get(
-                    "POLYRECO_ACTIVE_PLANE_PRUNING_OUTPUT_JSON",
-                    f"/private/tmp/{model_name}_active_plane_pruning_corrected.json",
-                )
-            )
-            diagnostic_payload = diagnose_active_plane_pruning_corrected(
-                model_name=model_name,
-                vertices=vertices,
-                model_faces=model_face_planes(vertices, model.faces),
-                final_candidates=baseline_candidates,
-                final_reconstructed=baseline_reconstructed,
-                trusted_points=trusted_cloud_points,
-                trusted_z_indices=trusted_cloud_z_indices,
-                point_tol=float(args.compatibility_point_tol),
-                reconstruction_kwargs={
-                    "halfspace_slack": float(args.intersection_halfspace_slack),
-                    "feasibility_tol": float(args.intersection_feasibility_tol),
-                    "incidence_tol": float(args.intersection_incidence_tol),
-                    "vertex_merge_tol": float(args.intersection_vertex_merge_tol),
-                    "min_face_area": float(args.intersection_min_face_area),
-                    "triple_det_tol": float(args.intersection_triple_det_tol),
-                    "prune_redundant": bool(args.intersection_prune_redundant_planes),
-                    "redundancy_tol": float(args.intersection_redundancy_tol),
-                },
-                contours=contours,
-                baseline_payload=baseline_payload,
-                previous_pruning_payload=previous_pruning_payload,
-                baseline_json_path=str(baseline_json_path),
-                previous_pruning_json_path=str(previous_pruning_json_path),
-                max_full_trials=int(os.environ.get("POLYRECO_ACTIVE_PLANE_PRUNING_MAX_TRIALS", "25")),
-            )
-            diagnostic_payload["diagnostic_output_path"] = str(pruning_output)
-            diagnostic_payload["fast_path"] = "baseline_final_state_plus_in_process_stable_two_scales_trusted_cloud_before_selection"
-            pruning_output.parent.mkdir(parents=True, exist_ok=True)
-            pruning_output.write_text(
-                json.dumps(diagnostic_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            trials = diagnostic_payload.get("remove_one_full_trials") if isinstance(diagnostic_payload.get("remove_one_full_trials"), dict) else {}
-            print(
-                "active-plane-pruning-corrected model={model} trials={trials} safe={safe} output={output}".format(
-                    model=model_name,
-                    trials=int(trials.get("trial_count") or 0),
-                    safe=int(trials.get("safe_count") or 0),
-                    output=pruning_output,
-                )
-            )
+        if dispatch_post_multiscale_oracle_scope(
+            scope=str(os.environ.get("POLYRECO_ORACLE_DIAGNOSTIC_SCOPE") or "").strip(),
+            environment=os.environ,
+            args=args,
+            model_name=model_name,
+            vertices=vertices,
+            faces=model.faces,
+            contours=contours,
+            all_candidates=all_candidates,
+            trusted_points=trusted_cloud_points,
+            trusted_z_indices=trusted_cloud_z_indices,
+        ):
             return
         def run_selection(
             pool_candidates: list[dict[str, object]],
