@@ -73,9 +73,9 @@
     <div class="toolbar">
       <strong>PolyReco: исходные и восстановленные модели</strong>
       <label>Модель <select id="modelSelect"></select></label>
-      <label><input id="activeOnly" type="checkbox" checked> только активные плоскости</label>
-      <label><input id="showInactive" type="checkbox"> неактивные плоскости</label>
-      <label>непрозрачность плоскостей <input id="planeOpacity" type="range" min="0.05" max="0.75" step="0.05" value="0.32"></label>
+      <label><input id="showActivePatches" type="checkbox"> локальные патчи поддержки</label>
+      <label><input id="showInactivePatches" type="checkbox"> неактивные патчи поддержки</label>
+      <label>непрозрачность активных граней <input id="planeOpacity" type="range" min="0.10" max="0.90" step="0.05" value="0.62"></label>
     </div>
     <div id="metrics"></div>
   </header>
@@ -92,8 +92,8 @@
     const MODEL_LABELS = {round:'Round', princess:'Princess', radiant:'Radiant', pear:'Pear', cushion:'Cushion'};
     const PLOTS = ['plotReference','plotReconstructed','plotPlanes','plotOverlay'];
     const modelSelect = document.getElementById('modelSelect');
-    const activeOnly = document.getElementById('activeOnly');
-    const showInactive = document.getElementById('showInactive');
+    const showActivePatches = document.getElementById('showActivePatches');
+    const showInactivePatches = document.getElementById('showInactivePatches');
     const planeOpacity = document.getElementById('planeOpacity');
     let sharedCamera = null;
     let syncing = false;
@@ -134,7 +134,7 @@
       const items=[
         {label:`исходная: ${m.reference_vertices}V / ${m.reference_faces}F`, help:'V — число вершин, F — число граней эталонной InitialModel. Это справочная сложность: больше или меньше само по себе не означает лучше.'},
         {label:`восстановленная: ${m.reconstructed_vertices}V / ${m.reconstructed_faces}F`, help:'V — число вершин, F — число граней финальной edge-clip сетки. Это сложность сетки, а не прямая оценка качества.'},
-        {label:`плоскости: ${m.active_candidate_planes} активных / ${m.candidate_planes} всего`, help:'Активные плоскости образуют грани финального пересечения; «всего» — сохранённые кандидаты с конечным hull. Это диагностика сложности, а не оценка качества.'},
+        {label:`патчи поддержки: ${m.active_candidate_planes} активных / ${m.candidate_planes} всего`, help:'Это локальные hull наблюдаемых точек, по которым фитились плоскости. Их размер не равен размеру финальной грани. Активным назван кандидат, чья бесконечная плоскость после clipping образует грань модели.'},
         {label:`объём: ${fmt(m.volume,4)}`, help:'Объём замкнутой восстановленной модели в кубических единицах её координат. Лучше не больше или меньше, а ближе к объёму эталона.'},
         {label:`Euler: ${m.euler}`, help:'Характеристика Эйлера V−E+F. Для одной замкнутой связной поверхности без отверстий ожидается 2.'},
         {label:`boundary/non-manifold: ${m.boundary_edges}/${m.non_manifold_edges}`, help:'Слева — рёбра только с одной гранью. Справа — рёбра, у которых число примыкающих граней не равно 2; оно включает boundary-рёбра. Для замкнутой manifold-модели лучше 0 / 0.'},
@@ -149,7 +149,6 @@
         const metric=document.createElement('span');
         metric.textContent=item.label;
         metric.dataset.tooltip=item.help;
-        metric.title=item.help;
         metric.tabIndex=0;
         metrics.appendChild(metric);
       });
@@ -159,15 +158,18 @@
       const model=MODELS[modelSelect.value]; updateMetrics(model);
       const ref=[meshTrace(model.reference,'#c9d1dc',0.82,'Исходная модель'),edgeTrace(model.reference,'#202a36',2,'Рёбра исходной')];
       const rec=[meshTrace(model.reconstructed,'#2f80ed',0.64,'Восстановленная модель'),edgeTrace(model.reconstructed,'#174d91',2,'Рёбра восстановленной')];
-      const planeTraces=[meshTrace(model.reconstructed,'#2f80ed',0.20,'Восстановленная модель')];
-      planeTraces.push(planesTrace(model.planes,true,'#ef8a17',Number(planeOpacity.value),'Активные плоскости'));
-      if(!activeOnly.checked || showInactive.checked) planeTraces.push(planesTrace(model.planes,false,'#8f9bab',Math.min(.16,Number(planeOpacity.value)),'Неактивные плоскости'));
+      const planeTraces=[
+        meshTrace(model.reconstructed,'#ef8a17',Number(planeOpacity.value),'Активные clipped-грани'),
+        edgeTrace(model.reconstructed,'#9a4d00',2,'Рёбра активных граней'),
+      ];
+      if(showActivePatches.checked) planeTraces.push(planesTrace(model.planes,true,'#9b3fdb',0.82,'Локальные патчи поддержки'));
+      if(showInactivePatches.checked) planeTraces.push(planesTrace(model.planes,false,'#8f9bab',0.24,'Неактивные патчи поддержки'));
       const overlay=[meshTrace(model.reference,'#aeb7c4',0.30,'Исходная'),edgeTrace(model.reference,'#111827',2,'Исходная wireframe'),meshTrace(model.reconstructed,'#2f80ed',0.45,'Восстановленная'),edgeTrace(model.reconstructed,'#1d5ca8',2,'Восстановленная wireframe')];
       const config={responsive:true,displaylogo:false,scrollZoom:true};
       await Promise.all([
         Plotly.react('plotReference',ref,layout(`${MODEL_LABELS[model.name]} — исходная модель`),config),
         Plotly.react('plotReconstructed',rec,layout(`${MODEL_LABELS[model.name]} — восстановленная модель`),config),
-        Plotly.react('plotPlanes',planeTraces,layout(`${MODEL_LABELS[model.name]} — найденные плоскости`),config),
+        Plotly.react('plotPlanes',planeTraces,layout(`${MODEL_LABELS[model.name]} — активные грани пересечения`),config),
         Plotly.react('plotOverlay',overlay,layout(`${MODEL_LABELS[model.name]} — наложение`),config),
       ]);
       bindCameraSync();
@@ -186,8 +188,8 @@
     }
 
     modelSelect.addEventListener('change',()=>{sharedCamera=null;void render();});
-    activeOnly.addEventListener('change',()=>void render());
-    showInactive.addEventListener('change',()=>void render());
+    showActivePatches.addEventListener('change',()=>void render());
+    showInactivePatches.addEventListener('change',()=>void render());
     planeOpacity.addEventListener('input',()=>void render());
     modelSelect.value='round'; void render();
   </script>
