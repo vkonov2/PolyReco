@@ -182,7 +182,44 @@ def generate_html(models: dict[str, Any], plotly_javascript: str) -> str:
     select, input[type=range] {{ accent-color: #2563eb; }}
     select {{ min-width: 135px; padding: 6px 9px; border: 1px solid #bcc6d3; border-radius: 6px; background: white; }}
     #metrics {{ margin-top: 9px; display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; }}
-    #metrics span {{ padding: 4px 7px; background: #f3f6fa; border: 1px solid #dbe2eb; border-radius: 5px; }}
+    #metrics span {{
+      position: relative;
+      padding: 4px 7px;
+      background: #f3f6fa;
+      border: 1px solid #dbe2eb;
+      border-radius: 5px;
+      cursor: help;
+      outline: none;
+    }}
+    #metrics span::after {{
+      content: attr(data-tooltip);
+      position: absolute;
+      top: calc(100% + 7px);
+      left: 0;
+      z-index: 20;
+      width: max-content;
+      max-width: min(360px, 85vw);
+      padding: 8px 10px;
+      color: #f8fafc;
+      background: #172033;
+      border-radius: 6px;
+      box-shadow: 0 5px 16px rgba(15, 23, 42, .22);
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: normal;
+      pointer-events: none;
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(-3px);
+      transition: opacity .12s ease, transform .12s ease, visibility .12s ease;
+    }}
+    #metrics span:hover::after,
+    #metrics span:focus-visible::after {{
+      opacity: 1;
+      visibility: visible;
+      transform: translateY(0);
+    }}
+    #metrics span:focus-visible {{ box-shadow: 0 0 0 2px rgba(37, 99, 235, .35); }}
     main {{ padding: 12px; }}
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
     .panel {{ min-height: 430px; background: white; border: 1px solid #d8dee8; border-radius: 8px; overflow: hidden; }}
@@ -253,14 +290,28 @@ def generate_html(models: dict[str, Any], plotly_javascript: str) -> str:
     function fmt(value, digits=5) {{ return value == null ? '—' : Number(value).toFixed(digits); }}
     function updateMetrics(model) {{
       const m=model.metrics;
-      const items=[`исходная: ${{m.reference_vertices}}V / ${{m.reference_faces}}F`,`восстановленная: ${{m.reconstructed_vertices}}V / ${{m.reconstructed_faces}}F`,
-        `плоскости: ${{m.active_candidate_planes}} активных / ${{m.candidate_planes}} всего`,`объём: ${{fmt(m.volume,4)}}`,`Euler: ${{m.euler}}`,
-        `boundary/non-manifold: ${{m.boundary_edges}}/${{m.non_manifold_edges}}`];
-      if(m.normalized_chamfer_mean!=null) items.push(`Chamfer mean / bbox: ${{fmt(m.normalized_chamfer_mean,6)}}`);
-      if(m.normalized_robust_hausdorff_p99!=null) items.push(`robust Hausdorff p99 / bbox: ${{fmt(m.normalized_robust_hausdorff_p99,6)}}`);
-      if(m.f1_at_0_5_percent_bbox_diagonal!=null) items.push(`F1@0.5% bbox: ${{fmt(m.f1_at_0_5_percent_bbox_diagonal,3)}}`);
-      if(m.contour_distance_p95!=null) items.push(`контур p95: ${{fmt(m.contour_distance_p95,5)}}`);
-      document.getElementById('metrics').innerHTML=items.map(item=>`<span>${{item}}</span>`).join('');
+      const items=[
+        {{label:`исходная: ${{m.reference_vertices}}V / ${{m.reference_faces}}F`, help:'V — число вершин, F — число граней эталонной InitialModel. Это справочная сложность: больше или меньше само по себе не означает лучше.'}},
+        {{label:`восстановленная: ${{m.reconstructed_vertices}}V / ${{m.reconstructed_faces}}F`, help:'V — число вершин, F — число граней финальной edge-clip сетки. Это сложность сетки, а не прямая оценка качества.'}},
+        {{label:`плоскости: ${{m.active_candidate_planes}} активных / ${{m.candidate_planes}} всего`, help:'Активные плоскости образуют грани финального пересечения; «всего» — сохранённые кандидаты с конечным hull. Это диагностика сложности, а не оценка качества.'}},
+        {{label:`объём: ${{fmt(m.volume,4)}}`, help:'Объём замкнутой восстановленной модели в кубических единицах её координат. Лучше не больше или меньше, а ближе к объёму эталона.'}},
+        {{label:`Euler: ${{m.euler}}`, help:'Характеристика Эйлера V−E+F. Для одной замкнутой связной поверхности без отверстий ожидается 2.'}},
+        {{label:`boundary/non-manifold: ${{m.boundary_edges}}/${{m.non_manifold_edges}}`, help:'Слева — рёбра только с одной гранью. Справа — рёбра, у которых число примыкающих граней не равно 2; оно включает boundary-рёбра. Для замкнутой manifold-модели лучше 0 / 0.'}},
+      ];
+      if(m.normalized_chamfer_mean!=null) items.push({{label:`Chamfer mean / bbox: ${{fmt(m.normalized_chamfer_mean,6)}}`, help:'Симметричное среднее расстояние между выборками точек двух поверхностей, делённое на диагональ bbox эталона. Меньше — лучше; 0,001 означает 0,1% диагонали bbox.'}});
+      if(m.normalized_robust_hausdorff_p99!=null) items.push({{label:`robust Hausdorff p99 / bbox: ${{fmt(m.normalized_robust_hausdorff_p99,6)}}`, help:'Максимум из двух направленных 99-х перцентилей расстояний между выборками поверхностей, делённый на bbox. Меньше — лучше; это робастная выборочная метрика, а не точное расстояние Хаусдорфа.'}});
+      if(m.f1_at_0_5_percent_bbox_diagonal!=null) items.push({{label:`F1@0.5% bbox: ${{fmt(m.f1_at_0_5_percent_bbox_diagonal,3)}}`, help:'Гармоническое среднее precision и recall: долей точек двух поверхностей, лежащих не дальше 0,5% диагонали bbox. Больше — лучше; 1 — идеальное совпадение.'}});
+      if(m.contour_distance_p95!=null) items.push({{label:`контур p95: ${{fmt(m.contour_distance_p95,5)}}`, help:'95-й перцентиль симметричного расстояния между проекциями восстановленной модели и наблюдаемыми теневыми контурами. Меньше — лучше; сравнивать следует результаты одного evaluator.'}});
+      const metrics=document.getElementById('metrics');
+      metrics.replaceChildren();
+      items.forEach(item=>{{
+        const metric=document.createElement('span');
+        metric.textContent=item.label;
+        metric.dataset.tooltip=item.help;
+        metric.title=item.help;
+        metric.tabIndex=0;
+        metrics.appendChild(metric);
+      }});
     }}
 
     async function render() {{
