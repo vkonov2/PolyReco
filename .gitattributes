@@ -1,0 +1,4 @@
+# Сохранять исходные координаты побайтно, в том числе на Windows.
+data/** -text -whitespace
+# Результаты включают JSON больше ограничения обычного GitHub blob.
+output/** filter=lfs diff=lfs merge=lfs -text

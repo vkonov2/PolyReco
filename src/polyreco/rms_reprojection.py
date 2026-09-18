@@ -142,6 +142,232 @@ def reprojection_directions(count: int) -> np.ndarray:
     return np.column_stack([np.cos(angles), np.sin(angles)])
 
 
+def ray_polygon_outer_radii(
+    polygon: np.ndarray,
+    origin: np.ndarray,
+    directions: np.ndarray,
+    *,
+    tol: float = 1e-10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the farthest non-negative intersection for every 2D ray.
+
+    The polygon is treated as an ordered closed polyline.  Taking the farthest
+    intersection keeps the metric meaningful if an observed contour contains a
+    small non-convex sampling artefact or a ray crosses the boundary more than
+    once.
+    """
+
+    poly = np.asarray(polygon, dtype=float)
+    center = np.asarray(origin, dtype=float).reshape(2)
+    dirs = np.asarray(directions, dtype=float)
+    if (
+        poly.ndim != 2
+        or poly.shape[1] != 2
+        or dirs.ndim != 2
+        or dirs.shape[1] != 2
+    ):
+        raise ValueError("Expected polygon Nx2, origin 2D and directions Mx2")
+    poly = poly[np.all(np.isfinite(poly), axis=1)]
+    if poly.shape[0] > 1 and float(np.linalg.norm(poly[0] - poly[-1])) <= tol:
+        poly = poly[:-1]
+    if poly.shape[0] < 3:
+        return np.full(dirs.shape[0], float("nan"), dtype=float), np.zeros(dirs.shape[0], dtype=int)
+
+    starts = poly
+    edges = np.roll(poly, -1, axis=0) - starts
+    rel = starts - center[None, :]
+
+    # O + t*d = A + u*edge.  In 2D:
+    # t = cross(A-O, edge) / cross(d, edge)
+    # u = cross(A-O, d)    / cross(d, edge)
+    denominator = (
+        dirs[:, 0, None] * edges[None, :, 1]
+        - dirs[:, 1, None] * edges[None, :, 0]
+    )
+    t_numerator = rel[:, 0] * edges[:, 1] - rel[:, 1] * edges[:, 0]
+    u_numerator = (
+        rel[None, :, 0] * dirs[:, None, 1]
+        - rel[None, :, 1] * dirs[:, None, 0]
+    )
+    non_parallel = np.abs(denominator) > tol
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ray_t = t_numerator[None, :] / denominator
+        edge_u = u_numerator / denominator
+    valid = (
+        non_parallel
+        & np.isfinite(ray_t)
+        & np.isfinite(edge_u)
+        & (ray_t >= -tol)
+        & (edge_u >= -tol)
+        & (edge_u <= 1.0 + tol)
+    )
+    hit_counts = np.sum(valid, axis=1, dtype=int)
+    candidates = np.where(valid, np.maximum(ray_t, 0.0), -np.inf)
+    radii = np.max(candidates, axis=1)
+    radii[hit_counts == 0] = float("nan")
+    return radii, hit_counts
+
+
+def polar_radial_error_summary(observed_radii: np.ndarray, model_radii: np.ndarray) -> dict[str, object]:
+    observed = np.asarray(observed_radii, dtype=float)
+    model = np.asarray(model_radii, dtype=float)
+    if observed.shape != model.shape:
+        raise ValueError("Observed and model radial profiles must have the same shape")
+    valid = np.isfinite(observed) & np.isfinite(model)
+    missing_observed = int(np.sum(~np.isfinite(observed)))
+    missing_model = int(np.sum(np.isfinite(observed) & ~np.isfinite(model)))
+    if not np.any(valid):
+        return {
+            "sample_count": 0,
+            "missing_observed_rays": missing_observed,
+            "missing_model_rays": missing_model,
+        }
+
+    observed = observed[valid]
+    signed = model[valid] - observed
+    absolute = np.abs(signed)
+    squared = signed * signed
+    outside = signed[signed > 0.0]
+    inside = -signed[signed < 0.0]
+    observed_energy = float(np.sum(observed * observed))
+    squared_error_sum = float(np.sum(squared))
+    relative_squared_error = squared_error_sum / max(observed_energy, EPS)
+    return {
+        "sample_count": int(signed.size),
+        "missing_observed_rays": missing_observed,
+        "missing_model_rays": missing_model,
+        "squared_error_sum": as_json_float(squared_error_sum),
+        "mean_squared_error": as_json_float(float(np.mean(squared))),
+        "root_mean_squared_error": as_json_float(float(np.sqrt(np.mean(squared)))),
+        "mean_absolute_error": as_json_float(float(np.mean(absolute))),
+        "median_absolute_error": as_json_float(float(np.median(absolute))),
+        "p90_absolute_error": as_json_float(float(np.percentile(absolute, 90))),
+        "p95_absolute_error": as_json_float(float(np.percentile(absolute, 95))),
+        "p99_absolute_error": as_json_float(float(np.percentile(absolute, 99))),
+        "max_absolute_error": as_json_float(float(np.max(absolute))),
+        "mean_signed_error": as_json_float(float(np.mean(signed))),
+        "median_signed_error": as_json_float(float(np.median(signed))),
+        "model_outside_ray_fraction": as_json_float(float(np.mean(signed > 0.0))),
+        "model_inside_ray_fraction": as_json_float(float(np.mean(signed < 0.0))),
+        "model_outside_mean_error": (
+            as_json_float(float(np.mean(outside))) if outside.size else None
+        ),
+        "model_outside_root_mean_squared_error": (
+            as_json_float(float(np.sqrt(np.mean(outside * outside)))) if outside.size else None
+        ),
+        "model_inside_mean_error": (
+            as_json_float(float(np.mean(inside))) if inside.size else None
+        ),
+        "model_inside_root_mean_squared_error": (
+            as_json_float(float(np.sqrt(np.mean(inside * inside)))) if inside.size else None
+        ),
+        "observed_radius_mean": as_json_float(float(np.mean(observed))),
+        "observed_radius_rms": as_json_float(float(np.sqrt(np.mean(observed * observed)))),
+        "relative_squared_error": as_json_float(relative_squared_error),
+        "relative_root_mean_squared_error": as_json_float(float(np.sqrt(relative_squared_error))),
+    }
+
+
+def evaluate_polyhedron_polar_reprojection(
+    *,
+    name: str,
+    vertices_3d: np.ndarray,
+    contours: list[object],
+    polar_origin_3d: np.ndarray,
+    ray_count: int,
+    contour_sample: int | None = None,
+) -> dict[str, object]:
+    """Compare observed and projected silhouettes on a common polar ray grid."""
+
+    started = time.perf_counter()
+    vertices = np.asarray(vertices_3d, dtype=float)
+    origin_3d = np.asarray(polar_origin_3d, dtype=float).reshape(3)
+    if vertices.ndim != 2 or vertices.shape[0] == 0 or vertices.shape[1] != 3:
+        return {"name": name, "valid": False, "reason": "empty_vertices"}
+
+    selected = list(contours)
+    if (
+        contour_sample is not None
+        and int(contour_sample) > 0
+        and len(selected) > int(contour_sample)
+    ):
+        idx = np.linspace(0, len(selected) - 1, int(contour_sample), dtype=int)
+        selected = [selected[int(i)] for i in idx]
+    directions = reprojection_directions(ray_count)
+    rows: list[dict[str, object]] = []
+    all_observed: list[np.ndarray] = []
+    all_model: list[np.ndarray] = []
+
+    for contour in selected:
+        normal = np.asarray(contour.normal, dtype=float)
+        observed_polygon = project_points_to_contour_2d(
+            np.asarray(contour.points, dtype=float),
+            normal,
+        )
+        projected_vertices = project_points_to_contour_2d(vertices, normal)
+        model_polygon = convex_hull_2d(projected_vertices)
+        origin_2d = project_points_to_contour_2d(origin_3d[None, :], normal)[0]
+        observed_radii, observed_hits = ray_polygon_outer_radii(
+            observed_polygon,
+            origin_2d,
+            directions,
+        )
+        model_radii, model_hits = ray_polygon_outer_radii(model_polygon, origin_2d, directions)
+        summary = polar_radial_error_summary(observed_radii, model_radii)
+        valid = np.isfinite(observed_radii) & np.isfinite(model_radii)
+        if np.any(valid):
+            all_observed.append(observed_radii[valid])
+            all_model.append(model_radii[valid])
+        rows.append(
+            {
+                "contour_index": int(contour.index),
+                "contour_angle": as_json_float(float(contour.angle)),
+                "polar_origin_2d": [as_json_float(float(v)) for v in origin_2d],
+                "observed_polygon_points": int(observed_polygon.shape[0]),
+                "model_hull_vertices": int(model_polygon.shape[0]),
+                "observed_multi_hit_ray_count": int(np.sum(observed_hits > 1)),
+                "model_multi_hit_ray_count": int(np.sum(model_hits > 1)),
+                **summary,
+            }
+        )
+
+    if not all_observed:
+        return {
+            "name": name,
+            "valid": False,
+            "reason": "no_common_ray_intersections",
+            "view_count": int(len(rows)),
+        }
+
+    observed_all = np.concatenate(all_observed)
+    model_all = np.concatenate(all_model)
+    aggregate = polar_radial_error_summary(observed_all, model_all)
+    angular_step = 2.0 * np.pi / max(8, int(ray_count))
+    squared_error_sum = finite_float(aggregate.get("squared_error_sum"), 0.0)
+    rows.sort(key=lambda row: finite_float(row.get("root_mean_squared_error"), -1.0), reverse=True)
+    return {
+        "name": name,
+        "valid": True,
+        "metric": "common_origin_outer_ray_radial_difference",
+        "sign_convention": "model_radius_minus_observed_radius",
+        "positive_error_meaning": "projected model extends outside the observed contour",
+        "observed_contour_mode": "ordered_polyline_farthest_ray_intersection",
+        "model_contour_mode": "convex_hull_of_projected_polyhedron_vertices",
+        "polar_origin_3d": [as_json_float(float(v)) for v in origin_3d],
+        "view_count": int(len(rows)),
+        "ray_count_per_view": int(max(8, int(ray_count))),
+        "requested_contour_sample": int(len(selected)),
+        "angular_step_radians": as_json_float(angular_step),
+        "angular_integrated_squared_error_sum": as_json_float(angular_step * squared_error_sum),
+        **aggregate,
+        "missing_observed_rays": int(sum(int(row.get("missing_observed_rays", 0)) for row in rows)),
+        "missing_model_rays": int(sum(int(row.get("missing_model_rays", 0)) for row in rows)),
+        "worst_views": rows[:12],
+        "per_view": sorted(rows, key=lambda row: int(row["contour_index"])),
+        "timing_seconds": as_json_float(time.perf_counter() - started),
+    }
+
+
 def contour_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     u = lateral_axis_for_normal(normal)
     v = np.cross(normal, u)
@@ -245,10 +471,13 @@ def evaluate_polyhedron_reprojection(
 __all__ = [
     "contour_basis",
     "convex_hull_2d",
+    "evaluate_polyhedron_polar_reprojection",
     "evaluate_polyhedron_reprojection",
+    "polar_radial_error_summary",
     "point_to_face_polygon_distance",
     "point_to_polygon_distance_2d",
     "project_points_to_contour_2d",
+    "ray_polygon_outer_radii",
     "reprojection_directions",
     "surface_distance_summary",
 ]

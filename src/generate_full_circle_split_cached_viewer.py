@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -677,14 +679,25 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     .plot { min-height: 200px; border-radius: 12px; overflow: hidden; }
     .side-controls { padding: 10px; display: grid; gap: 10px; align-content: start; }
     .bottom-main { display: grid; grid-template-columns: 1fr 260px; gap: 10px; align-items: stretch; }
-    .stack { display: grid; grid-template-rows: 1.75fr 0.85fr; gap: 10px; }
+    .stack { display: grid; gap: 10px; }
+    .compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .ideal-plot-card { overflow: hidden; }
+    .ideal-plot-toolbar { padding: 8px 12px; display: flex; justify-content: flex-end; border-bottom: 1px solid var(--line); }
+    .ideal-plot-card .plot { border: 0; border-radius: 0; box-shadow: none; }
+    .all-z-toolbar { padding: 10px 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+    .all-z-toolbar strong { margin-right: 4px; }
+    .all-z-overlay-card { overflow: hidden; }
+    .all-z-overlay-card .all-z-toolbar { border-bottom: 1px solid var(--line); }
+    .all-z-overlay-card .plot { border: 0; border-radius: 0; box-shadow: none; }
+    .section-note { padding: 10px 12px; line-height: 1.45; }
+    .section-note strong { color: var(--accent); }
     .params { padding: 10px; display: grid; gap: 9px; align-content: start; }
     .z-wide { padding: 10px 12px; }
     .small { font-size: 12px; color: var(--muted); }
     @media (max-width: 1100px) {
       .top-main { grid-template-columns: 1fr; }
       .bottom-main { grid-template-columns: 1fr; }
-      .stack { grid-template-rows: 52vh 32vh; }
+      .compare-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -694,7 +707,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       <div class=\"field\" style=\"max-width:300px;\">
         <label for=\"modelSel\">Model</label>
         <select id=\"modelSel\"></select>
-        <div class=\"small\">Выберите модель огранки. При смене модели пересчитываются функция и активные контуры.</div>
+        <div class=\"small\">Выберите модель огранки. Для каждого Z одна и та же метрика считается по наблюдаемым теневым контурам и по идеальным теням InitialModel.</div>
       </div>
     </div>
 
@@ -723,7 +736,15 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     <div class=\"bottom-main\">
       <div class=\"stack\">
         <div id=\"contextPlot\" class=\"panel plot\" style=\"height:62vh;\"></div>
-        <div id=\"fnPlot\" class=\"panel plot\" style=\"height:32vh;\"></div>
+        <div class=\"compare-grid\">
+          <div id=\"fnPlot\" class=\"panel plot\" style=\"height:38vh;\"></div>
+          <div class=\"panel ideal-plot-card\">
+            <div class=\"ideal-plot-toolbar\">
+              <label class=\"checkline\"><input id=\"overlayObservedOnIdealChk\" type=\"checkbox\" />Наложить observed-графики</label>
+            </div>
+            <div id=\"idealFnPlot\" class=\"plot\" style=\"height:34vh;\"></div>
+          </div>
+        </div>
       </div>
       <div class=\"panel params\">
         <div class=\"field\">
@@ -757,9 +778,11 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           <div class=\"small\">Показывать локальные минимумы RMS не выше чем global_min + (max-min)*pct/100.</div>
         </div>
         <div class=\"field\">
-          <label>Section visibility</label>
-          <label class=\"checkline\"><input id=\"showRedSectionChk\" type=\"checkbox\" checked />Red section</label>
-          <label class=\"checkline\"><input id=\"showYellowSectionChk\" type=\"checkbox\" checked />Yellow minima section + points</label>
+          <label>Слои 3D-сцены</label>
+          <label class=\"checkline\"><input id=\"showRedSectionChk\" type=\"checkbox\" checked />Наблюдаемые контуры</label>
+          <label class=\"checkline\"><input id=\"showIdealSectionChk\" type=\"checkbox\" checked />Идеальные контуры InitialModel</label>
+          <label class=\"checkline\"><input id=\"showYellowSectionChk\" type=\"checkbox\" checked />Точки локальных минимумов RMS</label>
+          <label class=\"checkline\"><input id=\"sharedYScaleChk\" type=\"checkbox\" checked />Одинаковый масштаб Y</label>
           <div class=\"small\">Управление отображением сечений на 3D-сцене.</div>
         </div>
         <div class=\"field\">
@@ -785,6 +808,16 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     </div>
 
     <div id=\"allMinimaPlot\" class=\"panel plot\" style=\"height:80vh;\"></div>
+
+    <div class=\"panel all-z-overlay-card\">
+      <div class=\"all-z-toolbar\">
+        <strong>Все Z в одной 3D-сцене:</strong>
+        <label class=\"checkline\"><input id=\"showAllZModelChk\" type=\"checkbox\" checked />InitialModel</label>
+        <label class=\"checkline\"><input id=\"showAllZObservedMinimaChk\" type=\"checkbox\" checked />Observed minima</label>
+        <label class=\"checkline\"><input id=\"showAllZIdealMinimaChk\" type=\"checkbox\" checked />Ideal minima</label>
+      </div>
+      <div id=\"allMinimaOverlayPlot\" class=\"plot\" style=\"height:80vh;\"></div>
+    </div>
   </div>
 
   <script id=\"cacheData\" type=\"application/json\">__CACHE_JSON__</script>
@@ -976,21 +1009,34 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       contextCamera: null,
       allMinimaCameraLeft: null,
       allMinimaCameraRight: null,
+      allMinimaCameraIdeal: null,
+      allMinimaOverlayCamera: null,
       zoomAbs: 1.0,
       zStep: 0.01,
       window: 10,
       rmsMinPct: 10.0,
       showRedSection: true,
+      showIdealSection: true,
       showYellowSection: true,
+      sharedYScale: true,
+      overlayObservedOnIdeal: false,
+      showAllZModel: true,
+      showAllZObservedMinima: true,
+      showAllZIdealMinima: true,
       zIdx: 0,
       trimBottom: 2,
       trimTop: 20,
       hoveredDistIdx: null,
       computed: null,
+      idealComputed: null,
       rmsMinimaCacheKey: null,
       rmsMinimaCache: null,
+      idealRmsMinimaCacheKey: null,
+      idealRmsMinimaCache: null,
       allMinimaCloudCacheKey: null,
       allMinimaCloudCache: null,
+      idealAllMinimaCloudCacheKey: null,
+      idealAllMinimaCloudCache: null,
     };
 
     const modelSel = document.getElementById('modelSel');
@@ -1004,12 +1050,19 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     const windowInput = document.getElementById('windowInput');
     const rmsMinPctInput = document.getElementById('rmsMinPctInput');
     const showRedSectionChk = document.getElementById('showRedSectionChk');
+    const showIdealSectionChk = document.getElementById('showIdealSectionChk');
     const showYellowSectionChk = document.getElementById('showYellowSectionChk');
+    const sharedYScaleChk = document.getElementById('sharedYScaleChk');
+    const overlayObservedOnIdealChk = document.getElementById('overlayObservedOnIdealChk');
+    const showAllZModelChk = document.getElementById('showAllZModelChk');
+    const showAllZObservedMinimaChk = document.getElementById('showAllZObservedMinimaChk');
+    const showAllZIdealMinimaChk = document.getElementById('showAllZIdealMinimaChk');
     const zIdx = document.getElementById('zIdx');
     const trimBottom = document.getElementById('trimBottom');
     const trimTop = document.getElementById('trimTop');
     const status = document.getElementById('status');
     const allMinimaPlot = document.getElementById('allMinimaPlot');
+    const allMinimaOverlayPlot = document.getElementById('allMinimaOverlayPlot');
     const viewXBtn = document.getElementById('viewXBtn');
     const viewYBtn = document.getElementById('viewYBtn');
     const viewZBtn = document.getElementById('viewZBtn');
@@ -1292,7 +1345,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       return out;
     }
 
-    function sectionPolygonFromEdges(m, zVal) {
+    function sectionPointsFromEdges(m, zVal) {
       const pts = [];
       const eps = 1e-9;
       for (const e of m.edges || []) {
@@ -1302,16 +1355,16 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
         const dz1 = p1[2] - zVal;
 
         if (Math.abs(dz0) <= eps && Math.abs(dz1) <= eps) {
-          pts.push([p0[0], p0[1]]);
-          pts.push([p1[0], p1[1]]);
+          pts.push([p0[0], p0[1], zVal]);
+          pts.push([p1[0], p1[1], zVal]);
           continue;
         }
         if (Math.abs(dz0) <= eps) {
-          pts.push([p0[0], p0[1]]);
+          pts.push([p0[0], p0[1], zVal]);
           continue;
         }
         if (Math.abs(dz1) <= eps) {
-          pts.push([p1[0], p1[1]]);
+          pts.push([p1[0], p1[1], zVal]);
           continue;
         }
         if (dz0 * dz1 < 0) {
@@ -1319,9 +1372,16 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           pts.push([
             p0[0] + t * (p1[0] - p0[0]),
             p0[1] + t * (p1[1] - p0[1]),
+            zVal,
           ]);
         }
       }
+      return dedup3(pts, 1e-7);
+    }
+
+    function sectionPolygonFromEdges(m, zVal) {
+      const section = sectionPointsFromEdges(m, zVal);
+      const pts = section.map(p => [p[0], p[1]]);
 
       const uniq = dedup2(pts, 1e-7);
       if (uniq.length < 3) return [];
@@ -1364,7 +1424,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
         x: segX,
         y: segY,
         z: segZ,
-        line: { color: '#ff2d55', width: 8 },
+        line: { color: '#00a6a6', width: 8 },
         hoverinfo: 'skip',
         showlegend: false,
       };
@@ -1374,7 +1434,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       return sectionObj;
     }
 
-    function oppositeSideAnnotation(m, activeIdx, nGon) {
+    function oppositeSideAnnotation(m, activeIdx, nGon, textPrefix, color, y) {
       if (!Number.isFinite(nGon) || nGon < 3) return [];
       let sumX = 0;
       let count = 0;
@@ -1391,70 +1451,22 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
         xref: 'paper',
         yref: 'paper',
         x: onRight ? 0.05 : 0.95,
-        y: 0.86,
-        text: `${nGon}-gon`,
+        y,
+        text: `${textPrefix}${nGon}-gon`,
         showarrow: false,
         xanchor: onRight ? 'left' : 'right',
         yanchor: 'middle',
         align: onRight ? 'left' : 'right',
-        font: { color: '#ff2d55', size: 16 },
+        font: { color, size: 16 },
         bgcolor: 'rgba(255,255,255,0.72)',
-        bordercolor: '#ff2d55',
+        bordercolor: color,
         borderwidth: 1,
         borderpad: 4,
       }];
     }
 
-    function recomputeDynamic() {
-      const m = ensureModelDecoded(state.modelName);
-      const halves = m.half_contours;
+    function computeFunctionsFromHalfPoints(halfPoints, halves, nLevels, window, source) {
       const nHalf = halves.length;
-      const zStep = Math.max(0.0005, Number(state.zStep) || 0.01);
-      const window = Math.max(2, Math.min(nHalf, Math.round(Number(state.window) || 2)));
-      state.zStep = zStep;
-      state.window = window;
-      zStepInput.value = String(zStep);
-      windowInput.value = String(window);
-
-      const pre = precomputedFunction(state.modelName, window);
-      if (pre) {
-        state.zStep = pre.zStep;
-        zStepInput.value = String(pre.zStep);
-        state.computed = {
-          zLevels: pre.zLevels,
-          nLevels: pre.nLevels,
-          nWindows: pre.nHalf,
-          distances: pre.distances,
-          fitRms: pre.fitRms,
-          linePoints: pre.linePoints || null,
-          source: 'precomputed',
-        };
-        state.hoveredDistIdx = null;
-        state.rmsMinimaCacheKey = null;
-        state.rmsMinimaCache = null;
-        state.allMinimaCloudCacheKey = null;
-        state.allMinimaCloudCache = null;
-        state.zIdx = Math.max(0, Math.min(state.zIdx, pre.nLevels - 1));
-        projIdx.max = String(Math.max(0, nHalf - 1));
-        return;
-      }
-
-      const nLevels = Math.max(2, Math.floor((m.z_max - m.z_min) / zStep) + 1);
-      const zLevels = new Float32Array(nLevels);
-      for (let i = 0; i < nLevels; i++) zLevels[i] = m.z_min + i * zStep;
-
-      const halfPoints = new Float32Array(nHalf * nLevels * 3);
-      for (let hi = 0; hi < nHalf; hi++) {
-        const hp = halves[hi].points_calc || halves[hi].points;
-        for (let zi = 0; zi < nLevels; zi++) {
-          const p = halfContourPointAtZ(hp, zLevels[zi]);
-          const off = (hi * nLevels + zi) * 3;
-          halfPoints[off] = p[0];
-          halfPoints[off + 1] = p[1];
-          halfPoints[off + 2] = p[2];
-        }
-      }
-
       const linePoints = new Float32Array(nHalf * nLevels * 3);
       linePoints.fill(NaN);
       const fitRms = new Float32Array(nHalf * nLevels);
@@ -1523,22 +1535,214 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           }
         }
       }
+      return { distances, fitRms, linePoints, source };
+    }
 
+    function idealHalfPointsForZGrid(m, zLevels) {
+      const halves = m.half_contours;
+      const nHalf = halves.length;
+      const nLevels = zLevels.length;
+      const firstZ = nLevels > 0 ? Number(zLevels[0]) : NaN;
+      const lastZ = nLevels > 0 ? Number(zLevels[nLevels - 1]) : NaN;
+      const zStep = nLevels > 1 ? Number(zLevels[1]) - firstZ : 0.0;
+      const cacheKey = [nLevels, firstZ.toPrecision(14), lastZ.toPrecision(14), zStep.toPrecision(14)].join('|');
+      if (m.idealHalfPointsCache && m.idealHalfPointsCache.key === cacheKey) {
+        return m.idealHalfPointsCache.halfPoints;
+      }
+
+      const halfPoints = new Float32Array(nHalf * nLevels * 3);
+      halfPoints.fill(NaN);
+      const center = Array.isArray(m.model_center) ? m.model_center.map(Number) : [0, 0, 0];
+
+      for (let zi = 0; zi < nLevels; zi++) {
+        const zWorld = Number(zLevels[zi]);
+        const zCentered = zWorld - center[2];
+        const section = sectionPointsFromEdges(m, zCentered);
+        if (section.length === 0) continue;
+
+        for (let hi = 0; hi < nHalf; hi++) {
+          const half = halves[hi];
+          const normal = half.normal_calc || half.normal;
+          if (Math.abs(Number(normal[2]) || 0.0) > 1e-8) {
+            throw new Error('InitialModel ideal metric currently requires horizontal projection normals');
+          }
+          let lx = -Number(normal[1]);
+          let ly = Number(normal[0]);
+          const ln = Math.hypot(lx, ly);
+          if (ln <= EPS) continue;
+          lx /= ln;
+          ly /= ln;
+
+          let best = null;
+          let bestSupport = Number(half.half_id) === 0 ? Infinity : -Infinity;
+          for (const p of section) {
+            const support = p[0] * lx + p[1] * ly;
+            if (
+              (Number(half.half_id) === 0 && support < bestSupport) ||
+              (Number(half.half_id) !== 0 && support > bestSupport)
+            ) {
+              bestSupport = support;
+              best = p;
+            }
+          }
+          if (!best) continue;
+          const off = (hi * nLevels + zi) * 3;
+          halfPoints[off] = best[0] + center[0];
+          halfPoints[off + 1] = best[1] + center[1];
+          halfPoints[off + 2] = zWorld;
+        }
+      }
+
+      m.idealHalfPointsCache = { key: cacheKey, halfPoints };
+      return halfPoints;
+    }
+
+    function computeIdealFunctions(m, zLevels, window) {
+      const halves = m.half_contours;
+      const nHalf = halves.length;
+      const nLevels = zLevels.length;
+      const halfPoints = idealHalfPointsForZGrid(m, zLevels);
+
+      const out = computeFunctionsFromHalfPoints(
+        halfPoints,
+        halves,
+        nLevels,
+        window,
+        'InitialModel ideal section support',
+      );
+      return {
+        zLevels,
+        nLevels,
+        nWindows: nHalf,
+        halfPoints,
+        ...out,
+      };
+    }
+
+    function idealBoundaryTrace(m, halfIndex) {
+      const computed = state.idealComputed;
+      if (!computed || !computed.halfPoints) {
+        return contourLineTrace([], '#00a6a6', 6);
+      }
+      const half = m.half_contours[halfIndex];
+      const normal = half.normal_calc || half.normal;
+      const center = Array.isArray(m.model_center) ? m.model_center.map(Number) : [0, 0, 0];
+      const observedPoints = half.points_calc || [];
+      let observedPlaneSupport = 0.0;
+      let observedPlaneCount = 0;
+      for (const p of observedPoints) {
+        if (!finite3(p)) continue;
+        observedPlaneSupport +=
+          (Number(p[0]) - center[0]) * normal[0] +
+          (Number(p[1]) - center[1]) * normal[1] +
+          (Number(p[2]) - center[2]) * normal[2];
+        observedPlaneCount += 1;
+      }
+      if (observedPlaneCount > 0) observedPlaneSupport /= observedPlaneCount;
+
+      let supportMax = -Infinity;
+      for (const p of m.vertices) {
+        const s = p[0] * normal[0] + p[1] * normal[1] + p[2] * normal[2];
+        if (s > supportMax) supportMax = s;
+      }
+      const push = supportMax + Number(CACHE.distance_scale || 0.18) * Number(m.model_radius || 1);
+      const sign = Number(half.half_id) === 1 ? -1 : 1;
+      const points = [];
+      for (let zi = 0; zi < computed.nLevels; zi++) {
+        const off = (halfIndex * computed.nLevels + zi) * 3;
+        const px = computed.halfPoints[off];
+        const py = computed.halfPoints[off + 1];
+        const pz = computed.halfPoints[off + 2];
+        if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) continue;
+        const bx = px - center[0];
+        const by = py - center[1];
+        const bz = pz - center[2];
+        const depth = bx * normal[0] + by * normal[1] + bz * normal[2];
+        const projectToObservedPlane = observedPlaneSupport - depth;
+        const normalShift = projectToObservedPlane + sign * push;
+        points.push([
+          bx + normal[0] * normalShift,
+          by + normal[1] * normalShift,
+          bz + normal[2] * normalShift,
+        ]);
+      }
+      return contourLineTrace(points, '#00a6a6', 6);
+    }
+
+    function clearMetricCaches() {
+      state.hoveredDistIdx = null;
+      state.rmsMinimaCacheKey = null;
+      state.rmsMinimaCache = null;
+      state.idealRmsMinimaCacheKey = null;
+      state.idealRmsMinimaCache = null;
+      state.allMinimaCloudCacheKey = null;
+      state.allMinimaCloudCache = null;
+      state.idealAllMinimaCloudCacheKey = null;
+      state.idealAllMinimaCloudCache = null;
+    }
+
+    function recomputeDynamic() {
+      const m = ensureModelDecoded(state.modelName);
+      const halves = m.half_contours;
+      const nHalf = halves.length;
+      const zStep = Math.max(0.0005, Number(state.zStep) || 0.01);
+      const window = Math.max(2, Math.min(nHalf, Math.round(Number(state.window) || 2)));
+      state.zStep = zStep;
+      state.window = window;
+      zStepInput.value = String(zStep);
+      windowInput.value = String(window);
+
+      const pre = precomputedFunction(state.modelName, window);
+      if (pre) {
+        state.zStep = pre.zStep;
+        zStepInput.value = String(pre.zStep);
+        state.computed = {
+          zLevels: pre.zLevels,
+          nLevels: pre.nLevels,
+          nWindows: pre.nHalf,
+          distances: pre.distances,
+          fitRms: pre.fitRms,
+          linePoints: pre.linePoints || null,
+          source: 'precomputed',
+        };
+        state.idealComputed = computeIdealFunctions(m, pre.zLevels, window);
+        clearMetricCaches();
+        state.zIdx = Math.max(0, Math.min(state.zIdx, pre.nLevels - 1));
+        projIdx.max = String(Math.max(0, nHalf - 1));
+        return;
+      }
+
+      const nLevels = Math.max(2, Math.floor((m.z_max - m.z_min) / zStep) + 1);
+      const zLevels = new Float32Array(nLevels);
+      for (let i = 0; i < nLevels; i++) zLevels[i] = m.z_min + i * zStep;
+
+      const halfPoints = new Float32Array(nHalf * nLevels * 3);
+      for (let hi = 0; hi < nHalf; hi++) {
+        const hp = halves[hi].points_calc || halves[hi].points;
+        for (let zi = 0; zi < nLevels; zi++) {
+          const p = halfContourPointAtZ(hp, zLevels[zi]);
+          const off = (hi * nLevels + zi) * 3;
+          halfPoints[off] = p[0];
+          halfPoints[off + 1] = p[1];
+          halfPoints[off + 2] = p[2];
+        }
+      }
+
+      const observed = computeFunctionsFromHalfPoints(
+        halfPoints,
+        halves,
+        nLevels,
+        window,
+        'observed contours',
+      );
       state.computed = {
         zLevels,
         nLevels,
         nWindows: nHalf,
-        distances,
-        fitRms,
-        linePoints,
-        source: 'dynamic',
+        ...observed,
       };
-
-      state.hoveredDistIdx = null;
-      state.rmsMinimaCacheKey = null;
-      state.rmsMinimaCache = null;
-      state.allMinimaCloudCacheKey = null;
-      state.allMinimaCloudCache = null;
+      state.idealComputed = computeIdealFunctions(m, zLevels, window);
+      clearMetricCaches();
       state.zIdx = Math.max(0, Math.min(state.zIdx, nLevels - 1));
       projIdx.max = String(Math.max(0, nHalf - 1));
     }
@@ -1561,20 +1765,19 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
 
     function renderTopPlot() {
       const m = ensureModelDecoded(state.modelName);
-      const c = m.half_contours[Math.max(0, Math.min(m.half_contours.length - 1, state.contourIdx))];
+      const contourIndex = Math.max(0, Math.min(m.half_contours.length - 1, state.contourIdx));
+      const c = m.half_contours[contourIndex];
       if (!state.topCamera) {
         state.topCamera = { eye: contourCamera(c.normal), projection: { type: state.projection } };
       } else {
         state.topCamera.projection = { type: state.projection };
       }
-      Plotly.react('topPlot', [
-        meshTrace(m),
-        edgeTrace(m),
-        cutLineTrace(m),
-        contourLineTrace(c.points, '#d62828', 8),
-      ], {
+      const data = [meshTrace(m), edgeTrace(m), cutLineTrace(m)];
+      if (state.showRedSection) data.push(contourLineTrace(c.points, '#d62828', 8));
+      if (state.showIdealSection) data.push(idealBoundaryTrace(m, contourIndex));
+      Plotly.react('topPlot', data, {
         margin: {l: 0, r: 0, b: 0, t: 44},
-        title: `${m.name} | seq=${c.seq_index} | merged-cont${String(c.source_index).padStart(3, '0')} half=${c.half_id}`,
+        title: `${m.name} | observed red · InitialModel ideal cyan | seq=${c.seq_index} | merged-cont${String(c.source_index).padStart(3, '0')} half=${c.half_id}`,
         scene: {
           xaxis: {title: 'X'},
           yaxis: {title: 'Y'},
@@ -1589,13 +1792,17 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       }, {responsive: true, displaylogo: false});
     }
 
-    function extractYAtZ(zIndex, keyName) {
-      const y = new Array(state.computed.nWindows);
-      const src = state.computed[keyName];
-      for (let i = 0; i < state.computed.nWindows; i++) {
-        y[i] = src ? src[i * state.computed.nLevels + zIndex] : NaN;
+    function extractYAtZFrom(computed, zIndex, keyName) {
+      const y = new Array(computed.nWindows);
+      const src = computed[keyName];
+      for (let i = 0; i < computed.nWindows; i++) {
+        y[i] = src ? src[i * computed.nLevels + zIndex] : NaN;
       }
       return y;
+    }
+
+    function extractYAtZ(zIndex, keyName) {
+      return extractYAtZFrom(state.computed, zIndex, keyName);
     }
 
     function finite3(p) {
@@ -1751,6 +1958,78 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       return state.rmsMinimaCache;
     }
 
+    function computeIdealRmsMinimaSelection() {
+      const empty = {
+        indices: [],
+        values: [],
+        points: [],
+        globalMin: NaN,
+        globalMax: NaN,
+        amplitude: NaN,
+        threshold: NaN,
+      };
+      const computed = state.idealComputed;
+      if (!computed || !computed.fitRms || !computed.linePoints) return empty;
+
+      const yFit = extractYAtZFrom(computed, state.zIdx, 'fitRms');
+      const n = yFit.length;
+      if (n < 3) return empty;
+      let globalMin = Infinity;
+      let globalMax = -Infinity;
+      for (const value of yFit) {
+        if (!Number.isFinite(value)) continue;
+        if (value < globalMin) globalMin = value;
+        if (value > globalMax) globalMax = value;
+      }
+      if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax)) return empty;
+      const amplitude = Math.max(0, globalMax - globalMin);
+      const threshold = globalMin + amplitude * (Math.max(0, Number(state.rmsMinPct) || 0) / 100.0);
+      const m = ensureModelDecoded(state.modelName);
+      const center = Array.isArray(m.model_center) ? m.model_center.map(Number) : [0, 0, 0];
+      const indices = [];
+      const values = [];
+      const points = [];
+      for (let i = 0; i < n; i++) {
+        const cur = yFit[i];
+        const prev = yFit[(i - 1 + n) % n];
+        const next = yFit[(i + 1) % n];
+        if (!Number.isFinite(cur) || !Number.isFinite(prev) || !Number.isFinite(next)) continue;
+        if (!(cur <= prev && cur <= next && (cur < prev || cur < next))) continue;
+        if (cur > threshold + 1e-12) continue;
+        const off = (i * computed.nLevels + state.zIdx) * 3;
+        const p = [
+          computed.linePoints[off] - center[0],
+          computed.linePoints[off + 1] - center[1],
+          computed.linePoints[off + 2] - center[2],
+        ];
+        if (!finite3(p)) continue;
+        indices.push(i);
+        values.push(cur);
+        points.push(p);
+      }
+      return { indices, values, points, globalMin, globalMax, amplitude, threshold };
+    }
+
+    function currentIdealRmsMinimaSelection() {
+      const computed = state.idealComputed;
+      if (!computed) return computeIdealRmsMinimaSelection();
+      const key = [
+        state.modelName,
+        computed.source || 'ideal',
+        state.window,
+        state.zIdx,
+        Number(state.rmsMinPct).toFixed(4),
+        computed.nLevels,
+        computed.nWindows,
+      ].join('|');
+      if (state.idealRmsMinimaCacheKey === key && state.idealRmsMinimaCache) {
+        return state.idealRmsMinimaCache;
+      }
+      state.idealRmsMinimaCacheKey = key;
+      state.idealRmsMinimaCache = computeIdealRmsMinimaSelection();
+      return state.idealRmsMinimaCache;
+    }
+
     function computeAllRmsMinimaCloud() {
       const empty = { points: [], text: [] };
       if (!state.computed || !state.computed.fitRms) return empty;
@@ -1826,30 +2105,104 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       return state.allMinimaCloudCache;
     }
 
-    function minimaPointsTrace(points, indices, values) {
+    function computeAllIdealRmsMinimaCloud() {
+      const empty = { points: [], text: [] };
+      const computed = state.idealComputed;
+      if (!computed || !computed.fitRms || !computed.linePoints) return empty;
+      const m = ensureModelDecoded(state.modelName);
+      const center = Array.isArray(m.model_center) ? m.model_center.map(Number) : [0, 0, 0];
+      const fit = computed.fitRms;
+      const lp = computed.linePoints;
+      const nLevels = computed.nLevels;
+      const nHalf = computed.nWindows;
+      const pct = Math.max(0, Number(state.rmsMinPct) || 0);
+      const points = [];
+      const text = [];
+
+      for (let zi = 0; zi < nLevels; zi++) {
+        let gMin = Infinity;
+        let gMax = -Infinity;
+        const y = new Array(nHalf);
+        for (let i = 0; i < nHalf; i++) {
+          const value = fit[i * nLevels + zi];
+          y[i] = value;
+          if (!Number.isFinite(value)) continue;
+          if (value < gMin) gMin = value;
+          if (value > gMax) gMax = value;
+        }
+        if (!Number.isFinite(gMin) || !Number.isFinite(gMax)) continue;
+        const threshold = gMin + Math.max(0, gMax - gMin) * (pct / 100.0);
+        for (let i = 0; i < nHalf; i++) {
+          const cur = y[i];
+          const prev = y[(i - 1 + nHalf) % nHalf];
+          const next = y[(i + 1) % nHalf];
+          if (!Number.isFinite(cur) || !Number.isFinite(prev) || !Number.isFinite(next)) continue;
+          if (!(cur <= prev && cur <= next && (cur < prev || cur < next))) continue;
+          if (cur > threshold + 1e-12) continue;
+          const off = (i * nLevels + zi) * 3;
+          const p = [
+            lp[off] - center[0],
+            lp[off + 1] - center[1],
+            lp[off + 2] - center[2],
+          ];
+          if (!finite3(p)) continue;
+          points.push(p);
+          text.push('ideal z_idx=' + zi + ', i=' + i + ', rms=' + Number(cur).toFixed(6));
+        }
+      }
+      return { points, text };
+    }
+
+    function currentAllIdealRmsMinimaCloud() {
+      const computed = state.idealComputed;
+      if (!computed) return computeAllIdealRmsMinimaCloud();
+      const key = [
+        state.modelName,
+        computed.source || 'ideal',
+        state.window,
+        Number(state.rmsMinPct).toFixed(4),
+        computed.nLevels,
+        computed.nWindows,
+      ].join('|');
+      if (state.idealAllMinimaCloudCacheKey === key && state.idealAllMinimaCloudCache) {
+        return state.idealAllMinimaCloudCache;
+      }
+      state.idealAllMinimaCloudCacheKey = key;
+      state.idealAllMinimaCloudCache = computeAllIdealRmsMinimaCloud();
+      return state.idealAllMinimaCloudCache;
+    }
+
+    function minimaPointsTrace(
+      points,
+      indices,
+      values,
+      color = '#ffd166',
+      outline = '#8a5a00',
+      label = 'RMS minima',
+    ) {
       return {
         type: 'scatter3d',
         mode: 'markers',
         x: points.map(p => p[0]),
         y: points.map(p => p[1]),
         z: points.map(p => p[2]),
-        marker: { size: 5, color: '#ffd166', line: { color: '#8a5a00', width: 1.2 } },
+        marker: { size: 5, color, line: { color: outline, width: 1.2 } },
         text: indices.map((i, k) => `i=${i}, rms=${Number(values[k]).toFixed(6)}`),
-        hovertemplate: '%{text}<extra>RMS minima</extra>',
+        hovertemplate: '%{text}<extra>' + label + '</extra>',
         showlegend: false,
       };
     }
 
-    function minimaCloudTrace(points, text) {
+    function minimaCloudTrace(points, text, color = '#1d4ed8', label = 'All RMS minima') {
       return {
         type: 'scatter3d',
         mode: 'markers',
         x: points.map(p => p[0]),
         y: points.map(p => p[1]),
         z: points.map(p => p[2]),
-        marker: { size: 2.7, color: '#1d4ed8', opacity: 0.95 },
+        marker: { size: 2.7, color, opacity: 0.95 },
         text,
-        hovertemplate: '%{text}<extra>All RMS minima</extra>',
+        hovertemplate: '%{text}<extra>' + label + '</extra>',
         showlegend: false,
       };
     }
@@ -1873,18 +2226,56 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       }
       const active = activeHalfIndices();
       const sectionObj = sectionTrace(m, zVal);
-      const data = [meshTrace(m), edgeTrace(m), cutLineTrace(m), zPlaneTrace(m, zVal)];
-      if (state.showRedSection) data.push(sectionObj.line);
-      for (const ci of active.out) data.push(contourLineTrace(m.half_contours[ci].points, '#ef476f', 5));
       const minima = currentRmsMinimaSelection();
+      const idealMinima = currentIdealRmsMinimaSelection();
+      const data = [meshTrace(m), edgeTrace(m), cutLineTrace(m), zPlaneTrace(m, zVal)];
+      if (state.showRedSection) {
+        for (const ci of active.out) {
+          data.push(contourLineTrace(m.half_contours[ci].points, '#ef476f', 5));
+        }
+      }
+      if (state.showIdealSection) {
+        data.push(sectionObj.line);
+        for (const ci of active.out) data.push(idealBoundaryTrace(m, ci));
+      }
       if (state.showYellowSection) {
         if (minima.points.length > 0) data.push(minimaPointsTrace(minima.points, minima.indices, minima.values));
+        if (idealMinima.points.length > 0) {
+          data.push(minimaPointsTrace(
+            idealMinima.points,
+            idealMinima.indices,
+            idealMinima.values,
+            '#00d4d4',
+            '#006666',
+            'InitialModel ideal minima',
+          ));
+        }
       }
-      const annotations = oppositeSideAnnotation(m, active.out, sectionObj.nGon);
+      const annotations = [];
+      if (state.showRedSection) {
+        annotations.push(...oppositeSideAnnotation(
+          m,
+          active.out,
+          sectionObj.nGon,
+          '',
+          '#ff2d55',
+          0.90,
+        ));
+      }
+      if (state.showIdealSection) {
+        annotations.push(...oppositeSideAnnotation(
+          m,
+          active.out,
+          sectionObj.nGon,
+          'ideal ',
+          '#00a6a6',
+          0.82,
+        ));
+      }
 
       Plotly.react('contextPlot', data, {
         margin: {l: 0, r: 0, b: 0, t: 44},
-        title: `Half-contours for hovered transition i=${active.di} (window=${state.window}, total=${active.out.length})`,
+        title: `Красные observed · бирюзовые ideal | i=${active.di} (window=${state.window})`,
         annotations,
         scene: {
           xaxis: {title: 'X'},
@@ -1912,21 +2303,32 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       } else {
         state.allMinimaCameraRight.projection = { type: state.projection };
       }
+      if (!state.allMinimaCameraIdeal) {
+        state.allMinimaCameraIdeal = { eye: {x: 1.25, y: 1.0, z: 0.8}, projection: { type: state.projection } };
+      } else {
+        state.allMinimaCameraIdeal.projection = { type: state.projection };
+      }
 
+      const cloud = currentAllRmsMinimaCloud();
+      const idealCloud = currentAllIdealRmsMinimaCloud();
       const data = [
         { ...meshTrace(m), scene: 'scene' },
         { ...edgeTrace(m), scene: 'scene' },
+        {
+          ...minimaCloudTrace(cloud.points, cloud.text, '#1d4ed8', 'Observed minima'),
+          scene: 'scene2',
+        },
+        {
+          ...minimaCloudTrace(idealCloud.points, idealCloud.text, '#00a6a6', 'InitialModel ideal minima'),
+          scene: 'scene3',
+        },
       ];
-      const cloud = currentAllRmsMinimaCloud();
-      if (state.showYellowSection && cloud.points.length > 0) {
-        data.push({ ...minimaCloudTrace(cloud.points, cloud.text), scene: 'scene2' });
-      }
 
       Plotly.react('allMinimaPlot', data, {
         margin: {l: 0, r: 0, b: 0, t: 44},
-        title: `Split view: model | minima cloud (count=${cloud.points.length})`,
+        title: `Все Z: InitialModel | observed minima (${cloud.points.length}) | ideal minima (${idealCloud.points.length})`,
         scene: {
-          domain: { x: [0.0, 0.49], y: [0.0, 1.0] },
+          domain: { x: [0.0, 0.32], y: [0.0, 1.0] },
           xaxis: {title: 'X'},
           yaxis: {title: 'Y'},
           zaxis: {title: 'Z'},
@@ -1938,7 +2340,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           aspectmode: 'data',
         },
         scene2: {
-          domain: { x: [0.51, 1.0], y: [0.0, 1.0] },
+          domain: { x: [0.34, 0.66], y: [0.0, 1.0] },
           xaxis: {title: 'X'},
           yaxis: {title: 'Y'},
           zaxis: {title: 'Z'},
@@ -1949,11 +2351,109 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
           uirevision: 'all-minima-camera-right-lock',
           aspectmode: 'data',
         },
+        scene3: {
+          domain: { x: [0.68, 1.0], y: [0.0, 1.0] },
+          xaxis: {title: 'X'},
+          yaxis: {title: 'Y'},
+          zaxis: {title: 'Z'},
+          camera: {
+            eye: scaledEye(state.allMinimaCameraIdeal.eye, state.zoomAbs),
+            projection: { type: state.projection },
+          },
+          uirevision: 'all-minima-camera-ideal-lock',
+          aspectmode: 'data',
+        },
       }, {responsive: true, displaylogo: false});
     }
 
-    function bindFnPlotMouseTracking(nPoints) {
-      const gd = document.getElementById('fnPlot');
+    function renderAllMinimaOverlayPlot() {
+      const m = ensureModelDecoded(state.modelName);
+      if (!state.allMinimaOverlayCamera) {
+        state.allMinimaOverlayCamera = {
+          eye: {x: 1.25, y: 1.0, z: 0.8},
+          projection: { type: state.projection },
+        };
+      } else {
+        state.allMinimaOverlayCamera.projection = { type: state.projection };
+      }
+
+      const cloud = currentAllRmsMinimaCloud();
+      const idealCloud = currentAllIdealRmsMinimaCloud();
+      const data = [
+        { ...meshTrace(m), scene: 'scene', visible: state.showAllZModel },
+        { ...edgeTrace(m), scene: 'scene', visible: state.showAllZModel },
+        {
+          ...minimaCloudTrace(cloud.points, cloud.text, '#1d4ed8', 'Observed minima'),
+          scene: 'scene',
+          visible: state.showAllZObservedMinima,
+        },
+        {
+          ...minimaCloudTrace(idealCloud.points, idealCloud.text, '#00a6a6', 'InitialModel ideal minima'),
+          scene: 'scene',
+          visible: state.showAllZIdealMinima,
+        },
+      ];
+
+      Plotly.react('allMinimaOverlayPlot', data, {
+        margin: {l: 0, r: 0, b: 0, t: 44},
+        title: `Все Z в одной сцене: InitialModel + observed minima (${cloud.points.length}) + ideal minima (${idealCloud.points.length})`,
+        scene: {
+          xaxis: {title: 'X'},
+          yaxis: {title: 'Y'},
+          zaxis: {title: 'Z'},
+          camera: {
+            eye: scaledEye(state.allMinimaOverlayCamera.eye, state.zoomAbs),
+            projection: { type: state.projection },
+          },
+          uirevision: `all-minima-overlay-camera-${state.modelName}`,
+          aspectmode: 'data',
+        },
+      }, {responsive: true, displaylogo: false});
+    }
+
+    function updateAllMinimaOverlayVisibility() {
+      Plotly.restyle('allMinimaOverlayPlot', {visible: state.showAllZModel}, [0, 1]);
+      Plotly.restyle('allMinimaOverlayPlot', {visible: state.showAllZObservedMinima}, [2]);
+      Plotly.restyle('allMinimaOverlayPlot', {visible: state.showAllZIdealMinima}, [3]);
+    }
+
+    function finiteUpperRange(a, b) {
+      let maxValue = 0.0;
+      for (const values of [a, b]) {
+        for (const value of values || []) {
+          if (Number.isFinite(value) && value > maxValue) maxValue = value;
+        }
+      }
+      return [0.0, Math.max(1e-9, maxValue * 1.04)];
+    }
+
+    function currentSharedRanges() {
+      const observedDistance = extractYAtZFrom(state.computed, state.zIdx, 'distances');
+      const idealDistance = extractYAtZFrom(state.idealComputed, state.zIdx, 'distances');
+      const observedRms = extractYAtZFrom(state.computed, state.zIdx, 'fitRms');
+      const idealRms = extractYAtZFrom(state.idealComputed, state.zIdx, 'fitRms');
+      return {
+        distance: finiteUpperRange(observedDistance, idealDistance),
+        rms: finiteUpperRange(observedRms, idealRms),
+      };
+    }
+
+    function updateMetricStatus() {
+      const zVal = state.computed.zLevels[state.zIdx] ?? NaN;
+      const n = state.computed.nWindows;
+      const i = Math.max(0, Math.min(n - 1, state.hoveredDistIdx == null ? 0 : state.hoveredDistIdx));
+      const observed = state.computed.fitRms[i * state.computed.nLevels + state.zIdx];
+      const ideal = state.idealComputed.fitRms[i * state.idealComputed.nLevels + state.zIdx];
+      const delta = Number.isFinite(observed) && Number.isFinite(ideal) ? observed - ideal : NaN;
+      status.textContent =
+        `z=${Number(zVal).toFixed(6)} | window=${state.window} | i=${i} | ` +
+        `observed RMS=${Number.isFinite(observed) ? Number(observed).toFixed(6) : '—'} | ` +
+        `ideal RMS=${Number.isFinite(ideal) ? Number(ideal).toFixed(6) : '—'} | ` +
+        `difference=${Number.isFinite(delta) ? Number(delta).toFixed(6) : '—'}`;
+    }
+
+    function bindFnPlotMouseTracking(plotId, nPoints) {
+      const gd = document.getElementById(plotId);
       gd.__nPoints = nPoints;
       if (gd.__mouseTrackingBound) return;
       gd.__mouseTrackingBound = true;
@@ -1971,6 +2471,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
         const clamped = Math.max(0, Math.min(gd.__nPoints - 1, idx));
         if (clamped === state.hoveredDistIdx) return;
         state.hoveredDistIdx = clamped;
+        updateMetricStatus();
         renderContextPlot();
       });
     }
@@ -1980,11 +2481,9 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       const yDist = extractYAtZ(state.zIdx, 'distances');
       const yFit = extractYAtZ(state.zIdx, 'fitRms');
       const x = Array.from({length: yDist.length}, (_, i) => i);
-      const zVal = state.computed.zLevels[state.zIdx] ?? NaN;
       const minima = currentRmsMinimaSelection();
-
-      const src = state.computed && state.computed.source ? state.computed.source : 'dynamic';
-      status.textContent = `${src}: z_step=${Number(state.zStep).toFixed(6)}, window=${state.window}, z=${Number(zVal).toFixed(6)}, n_half=${state.computed.nWindows}, minima=${minima.indices.length}, pct=${Number(state.rmsMinPct).toFixed(1)}%`;
+      const ranges = currentSharedRanges();
+      updateMetricStatus();
 
       const traces = [
         {
@@ -2054,23 +2553,142 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       }
 
       Plotly.react('fnPlot', traces, {
-        margin: {l: 58, r: 14, b: 48, t: 10},
+        margin: {l: 58, r: 14, b: 48, t: 44},
+        title: 'Наблюдаемые теневые контуры',
         xaxis: { title: 'Window transition index i (cyclic)', anchor: 'y2' },
         xaxis2: { matches: 'x', showticklabels: false, title: '', anchor: 'y' },
-        yaxis: { domain: [0.54, 1.0], title: 'Distance', anchor: 'x2' },
-        yaxis2: { domain: [0.0, 0.46], anchor: 'x', title: 'RMS error' },
+        yaxis: {
+          domain: [0.54, 1.0],
+          title: 'Distance',
+          anchor: 'x2',
+          range: state.sharedYScale ? ranges.distance : undefined,
+        },
+        yaxis2: {
+          domain: [0.0, 0.46],
+          anchor: 'x',
+          title: 'RMS error',
+          range: state.sharedYScale ? ranges.rms : undefined,
+        },
         legend: { orientation: 'h', x: 0.0, y: 1.08 },
       }, {responsive: true, displaylogo: false});
 
-      bindFnPlotMouseTracking(yDist.length);
+      bindFnPlotMouseTracking('fnPlot', yDist.length);
+    }
+
+    function renderIdealFnPlot() {
+      const computed = state.idealComputed;
+      const yDist = extractYAtZFrom(computed, state.zIdx, 'distances');
+      const yFit = extractYAtZFrom(computed, state.zIdx, 'fitRms');
+      const observedDist = extractYAtZFrom(state.computed, state.zIdx, 'distances');
+      const observedFit = extractYAtZFrom(state.computed, state.zIdx, 'fitRms');
+      const x = Array.from({length: yDist.length}, (_, i) => i);
+      const minima = currentIdealRmsMinimaSelection();
+      const ranges = currentSharedRanges();
+      const traces = [
+        {
+          type: 'scatter',
+          mode: 'lines',
+          x,
+          y: yDist,
+          name: 'Ideal Distance',
+          xaxis: 'x2',
+          yaxis: 'y',
+          line: { color: '#0077b6', width: 2.5 },
+          connectgaps: false,
+        },
+        {
+          type: 'scatter',
+          mode: 'lines',
+          x,
+          y: yFit,
+          name: 'Ideal RMS fit error',
+          xaxis: 'x',
+          yaxis: 'y2',
+          line: { color: '#00a6a6', width: 2.5 },
+          connectgaps: false,
+        },
+      ];
+      if (state.overlayObservedOnIdeal) {
+        traces.push({
+          type: 'scatter',
+          mode: 'lines',
+          x,
+          y: observedDist,
+          name: 'Observed Distance',
+          xaxis: 'x2',
+          yaxis: 'y',
+          line: { color: '#d97706', width: 2.0, dash: 'dash' },
+          connectgaps: false,
+        });
+        traces.push({
+          type: 'scatter',
+          mode: 'lines',
+          x,
+          y: observedFit,
+          name: 'Observed RMS fit error',
+          xaxis: 'x',
+          yaxis: 'y2',
+          line: { color: '#d62828', width: 2.0, dash: 'dash' },
+          connectgaps: false,
+        });
+      }
+      if (Number.isFinite(minima.threshold) && x.length > 0) {
+        traces.push({
+          type: 'scatter',
+          mode: 'lines',
+          x: [x[0], x[x.length - 1]],
+          y: [minima.threshold, minima.threshold],
+          name: 'RMS minima threshold',
+          xaxis: 'x',
+          yaxis: 'y2',
+          line: { color: '#ff9f1c', width: 1.5, dash: 'dot' },
+          hoverinfo: 'skip',
+        });
+      }
+      traces.push({
+        type: 'scatter',
+        mode: 'markers',
+        x: minima.indices,
+        y: minima.values,
+        name: 'Selected local minima',
+        xaxis: 'x',
+        yaxis: 'y2',
+        visible: state.showYellowSection ? true : 'legendonly',
+        showlegend: false,
+        marker: { size: 7, color: '#00d4d4', line: { color: '#006666', width: 1.2 } },
+      });
+
+      Plotly.react('idealFnPlot', traces, {
+        margin: {l: 58, r: 14, b: 48, t: 44},
+        title: 'Идеальные тени InitialModel (reference-only)',
+        xaxis: { title: 'Window transition index i (cyclic)', anchor: 'y2' },
+        xaxis2: { matches: 'x', showticklabels: false, title: '', anchor: 'y' },
+        yaxis: {
+          domain: [0.54, 1.0],
+          title: 'Distance',
+          anchor: 'x2',
+          range: state.sharedYScale ? ranges.distance : undefined,
+        },
+        yaxis2: {
+          domain: [0.0, 0.46],
+          anchor: 'x',
+          title: 'RMS error',
+          range: state.sharedYScale ? ranges.rms : undefined,
+        },
+        legend: { orientation: 'h', x: 0.0, y: 1.08 },
+      }, {responsive: true, displaylogo: false});
+
+      bindFnPlotMouseTracking('idealFnPlot', yDist.length);
     }
 
     function recomputeAndRender() {
       updateControlBoundsForModel();
       recomputeDynamic();
       renderFnPlot();
+      renderIdealFnPlot();
       renderContextPlot();
       renderAllMinimaPlot();
+      renderAllMinimaOverlayPlot();
       renderTopPlot();
     }
 
@@ -2081,6 +2699,8 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       state.contextCamera = null;
       state.allMinimaCameraLeft = null;
       state.allMinimaCameraRight = null;
+      state.allMinimaCameraIdeal = null;
+      state.allMinimaOverlayCamera = null;
       state.zIdx = 0;
       recomputeAndRender();
     });
@@ -2095,6 +2715,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       renderTopPlot();
       renderContextPlot();
       renderAllMinimaPlot();
+      renderAllMinimaOverlayPlot();
     });
 
     zoomAbs.addEventListener('input', () => {
@@ -2105,6 +2726,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       renderTopPlot();
       renderContextPlot();
       renderAllMinimaPlot();
+      renderAllMinimaOverlayPlot();
     });
 
     zoomAbs2.addEventListener('input', () => {
@@ -2115,6 +2737,7 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       renderTopPlot();
       renderContextPlot();
       renderAllMinimaPlot();
+      renderAllMinimaOverlayPlot();
     });
 
     function setContextView(axis) {
@@ -2144,40 +2767,82 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
       rmsMinPctInput.value = String(state.rmsMinPct);
       state.rmsMinimaCacheKey = null;
       state.rmsMinimaCache = null;
+      state.idealRmsMinimaCacheKey = null;
+      state.idealRmsMinimaCache = null;
       state.allMinimaCloudCacheKey = null;
       state.allMinimaCloudCache = null;
+      state.idealAllMinimaCloudCacheKey = null;
+      state.idealAllMinimaCloudCache = null;
       renderFnPlot();
+      renderIdealFnPlot();
       renderContextPlot();
       renderAllMinimaPlot();
+      renderAllMinimaOverlayPlot();
     });
 
     showRedSectionChk.addEventListener('change', () => {
       state.showRedSection = !!showRedSectionChk.checked;
+      renderTopPlot();
+      renderContextPlot();
+    });
+
+    showIdealSectionChk.addEventListener('change', () => {
+      state.showIdealSection = !!showIdealSectionChk.checked;
+      renderTopPlot();
       renderContextPlot();
     });
 
     showYellowSectionChk.addEventListener('change', () => {
       state.showYellowSection = !!showYellowSectionChk.checked;
       renderFnPlot();
+      renderIdealFnPlot();
       renderContextPlot();
-      renderAllMinimaPlot();
+    });
+
+    sharedYScaleChk.addEventListener('change', () => {
+      state.sharedYScale = !!sharedYScaleChk.checked;
+      renderFnPlot();
+      renderIdealFnPlot();
+    });
+
+    overlayObservedOnIdealChk.addEventListener('change', () => {
+      state.overlayObservedOnIdeal = !!overlayObservedOnIdealChk.checked;
+      renderIdealFnPlot();
+    });
+
+    showAllZModelChk.addEventListener('change', () => {
+      state.showAllZModel = !!showAllZModelChk.checked;
+      updateAllMinimaOverlayVisibility();
+    });
+
+    showAllZObservedMinimaChk.addEventListener('change', () => {
+      state.showAllZObservedMinima = !!showAllZObservedMinimaChk.checked;
+      updateAllMinimaOverlayVisibility();
+    });
+
+    showAllZIdealMinimaChk.addEventListener('change', () => {
+      state.showAllZIdealMinima = !!showAllZIdealMinimaChk.checked;
+      updateAllMinimaOverlayVisibility();
     });
 
     zIdx.addEventListener('input', () => {
       state.zIdx = Number(zIdx.value);
       renderFnPlot();
+      renderIdealFnPlot();
       renderContextPlot();
     });
 
     trimBottom.addEventListener('change', () => {
       state.trimBottom = Math.max(0, Number(trimBottom.value) || 0);
       renderFnPlot();
+      renderIdealFnPlot();
       renderContextPlot();
     });
 
     trimTop.addEventListener('change', () => {
       state.trimTop = Math.max(0, Number(trimTop.value) || 0);
       renderFnPlot();
+      renderIdealFnPlot();
       renderContextPlot();
     });
 
@@ -2188,7 +2853,13 @@ def build_html(cache_obj: dict[str, object], windows_cache_obj: dict[str, object
     zoomAbsLabel2.textContent = `${state.zoomAbs.toFixed(2)}x`;
     rmsMinPctInput.value = String(state.rmsMinPct);
     showRedSectionChk.checked = !!state.showRedSection;
+    showIdealSectionChk.checked = !!state.showIdealSection;
     showYellowSectionChk.checked = !!state.showYellowSection;
+    sharedYScaleChk.checked = !!state.sharedYScale;
+    overlayObservedOnIdealChk.checked = !!state.overlayObservedOnIdeal;
+    showAllZModelChk.checked = !!state.showAllZModel;
+    showAllZObservedMinimaChk.checked = !!state.showAllZObservedMinima;
+    showAllZIdealMinimaChk.checked = !!state.showAllZIdealMinima;
     recomputeAndRender();
   </script>
 </body>
@@ -2472,6 +3143,41 @@ def is_dynamic_cache_compatible(payload: object) -> bool:
     return True
 
 
+def load_embedded_model_cache(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    marker = '<script id="cacheData" type="application/json">'
+    start = text.find(marker)
+    if start < 0:
+        raise ValueError(f"Cannot find embedded cacheData in {path}")
+    start += len(marker)
+    end = text.find("</script>", start)
+    if end < 0:
+        raise ValueError(f"Cannot find closing cacheData script in {path}")
+    payload = json.loads(text[start:end])
+    if not is_dynamic_cache_compatible(payload):
+        raise ValueError(f"Embedded cache in {path} is incompatible with schema {CACHE_SCHEMA_VERSION}")
+    return payload
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -2505,6 +3211,12 @@ def main() -> None:
         "--cache-json",
         type=Path,
         default=Path("output/full_circle_split_dynamic_models_cache.json"),
+    )
+    parser.add_argument(
+        "--cache-html",
+        type=Path,
+        default=None,
+        help="Reuse the embedded model cache from an existing viewer HTML without creating another large cache file.",
     )
     parser.add_argument(
         "--output-html",
@@ -2560,7 +3272,10 @@ def main() -> None:
 
     explicit_models = [m.strip() for m in args.models.split(",") if m.strip()] or None
 
-    if args.cache_json.exists() and not args.rebuild_cache and explicit_models is None:
+    if args.cache_html is not None:
+        payload = load_embedded_model_cache(args.cache_html)
+        print(f"[cache] reuse embedded cache: {args.cache_html}")
+    elif args.cache_json.exists() and not args.rebuild_cache and explicit_models is None:
         payload = json.loads(args.cache_json.read_text(encoding="utf-8"))
         if is_dynamic_cache_compatible(payload):
             print(f"[cache] reuse existing: {args.cache_json}")
@@ -2639,8 +3354,7 @@ def main() -> None:
         windows_payload = json.loads(args.windows_cache_json.read_text(encoding="utf-8"))
 
     html = build_html(payload, windows_payload if args.embed_windows_cache_in_html else None)
-    args.output_html.parent.mkdir(parents=True, exist_ok=True)
-    args.output_html.write_text(html, encoding="utf-8")
+    atomic_write_text(args.output_html, html)
 
     size_mb = args.output_html.stat().st_size / (1024 * 1024)
     print(f"[done] html:  {args.output_html} ({size_mb:.2f} MB)")

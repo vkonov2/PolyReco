@@ -316,8 +316,17 @@ def build_model_payload(model_name: str, source_path: Path, quality: dict[str, A
     return enrich_viewer_model_metrics(model, selected=None, quality=quality)
 
 
-def generate_html(models: dict[str, Any], plotly_javascript: str) -> str:
+def generate_html(
+    models: dict[str, Any],
+    plotly_javascript: str,
+    *,
+    reconstructed_gray: bool = False,
+) -> str:
     embedded = json.dumps(models, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    reconstructed_mesh_color = "#c9d1dc" if reconstructed_gray else "#2f80ed"
+    reconstructed_edge_color = "#202a36" if reconstructed_gray else "#174d91"
+    overlay_reconstructed_mesh_color = "#aeb7c4" if reconstructed_gray else "#2f80ed"
+    overlay_reconstructed_edge_color = "#111827" if reconstructed_gray else "#1d5ca8"
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -506,14 +515,14 @@ def generate_html(models: dict[str, Any], plotly_javascript: str) -> str:
     async function render() {{
       const model=MODELS[modelSelect.value]; updateMetrics(model);
       const ref=[meshTrace(model.reference,'#c9d1dc',0.82,'Исходная модель'),edgeTrace(model.reference,'#202a36',2,'Рёбра исходной')];
-      const rec=[meshTrace(model.reconstructed,'#2f80ed',0.64,'Восстановленная модель'),edgeTrace(model.reconstructed,'#174d91',2,'Рёбра восстановленной')];
+      const rec=[meshTrace(model.reconstructed,'{reconstructed_mesh_color}',0.64,'Восстановленная модель'),edgeTrace(model.reconstructed,'{reconstructed_edge_color}',2,'Рёбра восстановленной')];
       const planeTraces=[
         meshTrace(model.reconstructed,'#ef8a17',Number(planeOpacity.value),'Активные clipped-грани'),
         edgeTrace(model.reconstructed,'#9a4d00',2,'Рёбра активных граней'),
       ];
       if(showActivePatches.checked) planeTraces.push(planesTrace(model.planes,true,'#9b3fdb',0.82,'Локальные патчи поддержки'));
       if(showInactivePatches.checked) planeTraces.push(planesTrace(model.planes,false,'#8f9bab',0.24,'Неактивные патчи поддержки'));
-      const overlay=[meshTrace(model.reference,'#aeb7c4',0.30,'Исходная'),edgeTrace(model.reference,'#111827',2,'Исходная wireframe'),meshTrace(model.reconstructed,'#2f80ed',0.45,'Восстановленная'),edgeTrace(model.reconstructed,'#1d5ca8',2,'Восстановленная wireframe')];
+      const overlay=[meshTrace(model.reference,'#aeb7c4',0.30,'Исходная'),edgeTrace(model.reference,'#111827',2,'Исходная wireframe'),meshTrace(model.reconstructed,'{overlay_reconstructed_mesh_color}',0.45,'Восстановленная'),edgeTrace(model.reconstructed,'{overlay_reconstructed_edge_color}',2,'Восстановленная wireframe')];
       const config={{responsive:true,displaylogo:false,scrollZoom:true}};
       await Promise.all([
         Plotly.react('plotReference',ref,layout(`${{MODEL_LABELS[model.name]}} — исходная модель`),config),
@@ -552,6 +561,11 @@ def main() -> None:
     parser.add_argument("--output-html", type=Path, default=Path("output/all_models_reconstruction_planes.html"))
     parser.add_argument("--benchmark-json", type=Path, default=Path("output/rms_cross_model_angular_benchmark.json"))
     parser.add_argument(
+        "--reconstructed-gray",
+        action="store_true",
+        help="Render the reconstructed mesh with the same gray palette as InitialModel.",
+    )
+    parser.add_argument(
         "--model-json",
         action="append",
         help="Explicit reconstruction artifact as model=path. Used only when the benchmark JSON has no embedded viewer payload.",
@@ -575,7 +589,14 @@ def main() -> None:
     plotly_path = Path("output/plotly-2.35.2.min.js")
     if not plotly_path.exists():
         raise FileNotFoundError(f"Plotly bundle not found: {plotly_path}")
-    args.output_html.write_text(generate_html(models, plotly_path.read_text(encoding="utf-8")), encoding="utf-8")
+    args.output_html.write_text(
+        generate_html(
+            models,
+            plotly_path.read_text(encoding="utf-8"),
+            reconstructed_gray=args.reconstructed_gray,
+        ),
+        encoding="utf-8",
+    )
     print(f"Wrote {args.output_html} ({args.output_html.stat().st_size} bytes)")
 
 
